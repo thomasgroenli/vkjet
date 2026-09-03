@@ -27,9 +27,13 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 #define ND 4
-#define NCH 5
 #define NF 15
 #define NCPR 8
+/* NCH is declared by the ROW FILE: the operator table references channel
+   indices, so the objective is not well defined without it. A
+   specialization constant lets one SPIR-V module serve any channel count
+   while the driver still sizes fld[NF][NCH]/A[NCH] exactly. */
+layout(constant_id = 2) const int NCH = 5;
 layout(constant_id = 0) const int SPEC_STRIDE = 0x7fffffff;
 layout(constant_id = 1) const int SPEC_TABLE_PERIOD = 0;
 layout(local_size_x = 256) in;
@@ -91,10 +95,10 @@ void main() {
     }
     if (ok) {
         float fld[NF][NCH];
-        [[unroll]] for(int j=0;j<NF;j++) [[unroll]] for(int ch=0;ch<NCH;ch++) fld[j][ch]=0.0;
+        [[unroll]] for(int j=0;j<NF;j++) for(int ch=0;ch<NCH;ch++) fld[j][ch]=0.0;
         int prim; float W[NF];
         for (int i=0;i<meta.num_combos;i++){ combo(i,ii,fr,pob,prim,W);
-            [[unroll]] for(int j=0;j<NF;j++) [[unroll]] for(int ch=0;ch<NCH;ch++) fld[j][ch]+=W[j]*primal[prim+ch]; }
+            [[unroll]] for(int j=0;j<NF;j++) for(int ch=0;ch<NCH;ch++) fld[j][ch]+=W[j]*primal[prim+ch]; }
         int op = rowrec[sn*4u];
         float rw = intBitsToFloat(rowrec[sn*4u+1u]);
         float rs = intBitsToFloat(rowrec[sn*4u+2u]);
@@ -106,7 +110,8 @@ void main() {
         for (int e=l0; e<l1; e++) {
             int pk = optab_i[lbase+e]; float v = optab_f[e];
             int cixp1 = pk & 15; if (cixp1>0) v *= rowc[sn*uint(NCPR)+uint(cixp1-1)];
-            r += v * fld[(pk>>8)][(pk>>4)&15];
+            int slk = (pk>>8);   /* slot NF = order-0 term */
+        r += (slk < NF) ? v * fld[slk][(pk>>4)&15] : v;
         }
         for (int e=q0; e<q1; e++) {
             int pk = optab_i[qbase+e]; float v = optab_f[meta.nnz_lin+e];

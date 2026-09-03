@@ -50,6 +50,16 @@ SLOT_DT, SLOT_DX, SLOT_DY, SLOT_DZ = 1, 2, 3, 4
 SLOT_DTT, SLOT_DXX, SLOT_DYY, SLOT_DZZ = 5, 6, 7, 8
 SLOT_DTX, SLOT_DTY, SLOT_DTZ = 9, 10, 11
 SLOT_DXY, SLOT_DXZ, SLOT_DYZ = 12, 13, 14
+# The ORDER-0 term of the same polynomial. A residual is
+#     r = c0 + <L, J(f)> + J'QJ
+# and the table carried order-1 (lin) and order-2 (quad) as entries while
+# order-0 lived as a per-row `s` scalar with a hardcoded minus sign.
+# SLOT_CONST is a linear entry with NO FIELD FACTOR, so the constant becomes
+# just another term of the series and its value rides the payload like every
+# other per-row coefficient. Slot 15 is free in the pack format
+# (slot<<8 | ch<<4 | cix+1, real slots 0..14), so this costs no new table
+# section, no meta field and no ABI change.
+SLOT_CONST = NF
 MIXED_PAIRS = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
 SLOT_NAMES = ["val", "dt", "dx", "dy", "dz", "dtt", "dxx", "dyy", "dzz",
               "dtx", "dty", "dtz", "dxy", "dxz", "dyz"]
@@ -63,7 +73,11 @@ class OperatorTable:
     payload c[cix]; omit or -1 for a constant coefficient. Q entries are NOT
     symmetrized — the gradient's product rule touches both sides."""
 
-    def __init__(self):
+    def __init__(self, n_channels=NCH):
+        # The table REFERENCES channel indices, so the objective it defines is
+        # not well posed without a channel count: it belongs to the row file
+        # alongside the operators, not to the solver.
+        self.n_channels = int(n_channels)
         self.names = []
         self.lin = []            # per op: list[(slot, ch, val, cix)]
         self.quad = []           # per op: list[(s1, c1, s2, c2, val, cix)]
@@ -79,18 +93,25 @@ class OperatorTable:
     def n_ops(self):
         return len(self.names)
 
-    def add_op(self, name, lin=(), quad=(), kernel=""):
+    def add_op(self, name, lin=(), quad=(), kernel="", const=()):
+        """const: [(val, cix), ...] — order-0 terms. cix < 0 is a literal
+        constant; cix >= 0 multiplies by payload slot cix, which is how a
+        per-row target/source is expressed without an `s` column."""
         L, Q = [], []
+        for e in const:
+            val = float(e[0]); cix = int(e[1]) if len(e) > 1 else -1
+            assert -1 <= cix < NCPR
+            L.append((int(SLOT_CONST), 0, val, cix))
         for e in lin:
             slot, ch, val = e[0], e[1], float(e[2])
             cix = int(e[3]) if len(e) > 3 else -1
-            assert 0 <= slot < NF and 0 <= ch < NCH and -1 <= cix < NCPR
+            assert 0 <= slot <= NF and 0 <= ch < self.n_channels and -1 <= cix < NCPR
             L.append((int(slot), int(ch), val, cix))
         for e in quad:
             s1, c1, s2, c2, val = e[0], e[1], e[2], e[3], float(e[4])
             cix = int(e[5]) if len(e) > 5 else -1
-            assert 0 <= s1 < NF and 0 <= c1 < NCH
-            assert 0 <= s2 < NF and 0 <= c2 < NCH and -1 <= cix < NCPR
+            assert 0 <= s1 < NF and 0 <= c1 < self.n_channels
+            assert 0 <= s2 < NF and 0 <= c2 < self.n_channels and -1 <= cix < NCPR
             Q.append((int(s1), int(c1), int(s2), int(c2), val, cix))
         self.names.append(str(name))
         self.lin.append(L)
@@ -140,8 +161,8 @@ class OperatorTable:
             kernels=np.asarray(self.kernels))
 
     @classmethod
-    def from_arrays(cls, a):
-        t = cls()
+    def from_arrays(cls, a, n_channels=None):
+        t = cls() if n_channels is None else cls(n_channels=int(n_channels))
         lo, qo = a["lin_off"], a["quad_off"]
         kern = (a["kernels"] if "kernels" in getattr(a, "files", a)
                 else [""] * len(a["names"]))
@@ -203,7 +224,7 @@ def row_residuals_oracle(fields, ops, op, w, s, c):
         k = int(op[i])
         for (slot, ch, val, cix) in ops.lin[k]:
             eff = val * (1.0 if cix < 0 else c[i, cix])
-            r[i] += eff * fields[i, slot, ch]
+            r[i] += eff if slot == SLOT_CONST else eff * fields[i, slot, ch]
         for (s1, c1, s2, c2, val, cix) in ops.quad[k]:
             eff = val * (1.0 if cix < 0 else c[i, cix])
             r[i] += eff * fields[i, s1, c1] * fields[i, s2, c2]
@@ -222,13 +243,14 @@ def row_loss_oracle(bases, iw, x_enc, C, ops, op, w, s, c, scale=1.0):
 _META_EQ_INTS = 8 + 9 * MAX_NDIM
 
 
-def pack_eqrow_meta(bases, n_samples, scale, n_ops, nnz_lin):
+def pack_eqrow_meta(bases, n_samples, scale, n_ops, nnz_lin, n_channels=NCH):
     nd = len(bases)
     order = [b.order for b in bases]
     extents = [b.primal_extent for b in bases]
-    pstride = primal_strides(extents, NCH)
+    pstride = primal_strides(extents, int(n_channels))
     m = np.zeros(_META_EQ_INTS, dtype=np.int32)
-    m[0] = nd; m[1] = n_samples; m[2] = NCH; m[3] = int(np.prod(order))
+    m[0] = nd; m[1] = n_samples; m[2] = int(n_channels)
+    m[3] = int(np.prod(order))
     m[4] = np.float32(scale).view(np.int32)
     m[5] = n_ops; m[6] = nnz_lin
 
@@ -260,17 +282,18 @@ class EqRowTerm:
         self.inv_widths = list(inv_widths)
         self.ops = ops
         self.extents = [b.primal_extent for b in bases]
-        self.primal_count = int(np.prod(self.extents)) * NCH
+        self.nch = int(getattr(ops, "n_channels", NCH))
+        self.primal_count = int(np.prod(self.extents)) * self.nch
         self.spec_stride = 1 if all(b.stride == 1 for b in bases) else 0x7fffffff
         self.spec_tper = 1 if all(b.table_period == 1 for b in bases) else 0
         self.grad_program = ctx.program(EQROW_GRAD_SPV, bindings=[STORAGE] * 12,
-                                        spec_constant_ids=[0, 1])
+                                        spec_constant_ids=[0, 1, 2])
         self.loss_program = ctx.program(EQROW_LOSS_SPV, bindings=[STORAGE] * 12,
-                                        spec_constant_ids=[0, 1])
+                                        spec_constant_ids=[0, 1, 2])
         self.diag_program = ctx.program(EQROW_DIAG_SPV, bindings=[STORAGE] * 12,
-                                        spec_constant_ids=[0, 1])
+                                        spec_constant_ids=[0, 1, 2])
         self.hvp_program = ctx.program(EQROW_HVP_SPV, bindings=[STORAGE] * 13,
-                                       spec_constant_ids=[0, 1])
+                                       spec_constant_ids=[0, 1, 2])
         self.coefs_buf = ctx.buffer(max(_value_coef_concat(self.bases).nbytes, 4))
         self.coefs_buf.upload(_value_coef_concat(self.bases))
         self.table_buf = ctx.buffer(max(_table_concat(self.bases).nbytes, 4))
@@ -303,7 +326,8 @@ class EqRowTerm:
         rr[:, 0] = op
         rr[:, 1] = w.view(np.int32)
         rr[:, 2] = s.view(np.int32)
-        meta_b = pack_eqrow_meta(self.bases, n, scale, self.n_ops, self.nnz_lin)
+        meta_b = pack_eqrow_meta(self.bases, n, scale, self.n_ops,
+                                 self.nnz_lin, n_channels=self.nch)
         xb = ctx.buffer(x_enc.nbytes); xb.upload(x_enc.reshape(-1))
         mb = ctx.buffer(len(meta_b), device_local=False); mb.upload(meta_b)
         rrb = ctx.buffer(rr.nbytes); rrb.upload(rr.reshape(-1))
@@ -316,10 +340,11 @@ class EqRowTerm:
         assert b is not None, "call bind_batch first"
         b["scale"] = float(scale)
         b["mb"].upload(pack_eqrow_meta(self.bases, b["n"], b["scale"],
-                                       self.n_ops, self.nnz_lin))
+                                       self.n_ops, self.nnz_lin,
+                                       n_channels=self.nch))
 
     def _spec(self):
-        return {0: self.spec_stride, 1: self.spec_tper}
+        return {0: self.spec_stride, 1: self.spec_tper, 2: self.nch}
 
     def _shared(self, coef_buf):
         b = self._batch

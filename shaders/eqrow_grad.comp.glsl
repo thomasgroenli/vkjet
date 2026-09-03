@@ -25,9 +25,13 @@
 #extension GL_EXT_shader_atomic_float : require
 
 #define ND 4
-#define NCH 5
 #define NF 15
 #define NCPR 8
+/* NCH is declared by the ROW FILE: the operator table references channel
+   indices, so the objective is not well defined without it. A
+   specialization constant lets one SPIR-V module serve any channel count
+   while the driver still sizes fld[NF][NCH]/A[NCH] exactly. */
+layout(constant_id = 2) const int NCH = 5;
 layout(constant_id = 0) const int SPEC_STRIDE = 0x7fffffff;
 layout(constant_id = 1) const int SPEC_TABLE_PERIOD = 0;
 layout(local_size_x = 256) in;
@@ -88,10 +92,10 @@ void main() {
         pob[d]=meta.coef_offset[d]+pmod(ii[d],meta.coef_period[d])*meta.order[d]*meta.degp1[d];
     }
     float fld[NF][NCH];
-    [[unroll]] for(int j=0;j<NF;j++) [[unroll]] for(int ch=0;ch<NCH;ch++) fld[j][ch]=0.0;
+    [[unroll]] for(int j=0;j<NF;j++) for(int ch=0;ch<NCH;ch++) fld[j][ch]=0.0;
     int prim; float W[NF];
     for (int i=0;i<meta.num_combos;i++){ combo(i,ii,fr,pob,prim,W);
-        [[unroll]] for(int j=0;j<NF;j++) [[unroll]] for(int ch=0;ch<NCH;ch++) fld[j][ch]+=W[j]*primal[prim+ch]; }
+        [[unroll]] for(int j=0;j<NF;j++) for(int ch=0;ch<NCH;ch++) fld[j][ch]+=W[j]*primal[prim+ch]; }
 
     int op = rowrec[sn*4u];
     float rw = intBitsToFloat(rowrec[sn*4u+1u]);
@@ -105,7 +109,8 @@ void main() {
     for (int e=l0; e<l1; e++) {
         int pk = optab_i[lbase+e]; float v = optab_f[e];
         int cixp1 = pk & 15; if (cixp1>0) v *= rowc[sn*uint(NCPR)+uint(cixp1-1)];
-        r += v * fld[(pk>>8)][(pk>>4)&15];
+        int slk = (pk>>8);   /* slot NF = order-0 term */
+        r += (slk < NF) ? v * fld[slk][(pk>>4)&15] : v;
     }
     for (int e=q0; e<q1; e++) {
         int pk = optab_i[qbase+e]; float v = optab_f[meta.nnz_lin+e];
@@ -117,11 +122,12 @@ void main() {
     /* scatter: per combo build the Jacobian row A[ch] from the entry lists */
     for (int i=0;i<meta.num_combos;i++){ combo(i,ii,fr,pob,prim,W);
         float A[NCH];
-        [[unroll]] for(int ch=0;ch<NCH;ch++) A[ch]=0.0;
+        for(int ch=0;ch<NCH;ch++) A[ch]=0.0;
         for (int e=l0; e<l1; e++) {
             int pk = optab_i[lbase+e]; float v = optab_f[e];
             int cixp1 = pk & 15; if (cixp1>0) v *= rowc[sn*uint(NCPR)+uint(cixp1-1)];
-            A[(pk>>4)&15] += v * W[pk>>8];
+            int slk = (pk>>8);   /* order-0 has no Jacobian */
+            if (slk < NF) A[(pk>>4)&15] += v * W[slk];
         }
         for (int e=q0; e<q1; e++) {
             int pk = optab_i[qbase+e]; float v = optab_f[meta.nnz_lin+e];
@@ -130,7 +136,7 @@ void main() {
             A[c1] += v * fld[s2][c2] * W[s1];
             A[c2] += v * fld[s1][c1] * W[s2];
         }
-        [[unroll]] for(int ch=0;ch<NCH;ch++)
+        for(int ch=0;ch<NCH;ch++)
             if (A[ch] != 0.0) atomicAdd(grad[prim+ch], a*A[ch]);
     }
 }

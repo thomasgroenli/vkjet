@@ -184,9 +184,28 @@ def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose):
 
 
 # --------------------------------------------------------------------------- #
+def multilinear_restrict(coef_fine: np.ndarray, ext_fine: Sequence[int],
+                         ext_coarse: Sequence[int], n_channels: int,
+                         order: int = 4) -> np.ndarray:
+    """Exact ADJOINT (transpose) of multilinear_resize: fine → coarse via Pᵀ.
+
+    Restriction must be the transpose of prolongation (same axis matrices, transposed)
+    — NOT an independent fine→coarse resize — so that the BPX preconditioner
+    C⁻¹ = Σ_l P_l D_l⁻¹ P_lᵀ is symmetric. Used by the multilevel preconditioner.
+    """
+    nd = len(ext_fine)
+    arr = np.ascontiguousarray(coef_fine, np.float64).reshape(tuple(ext_fine) + (n_channels,))
+    for ax in range(nd):
+        M = _axis_resize_matrix(ext_coarse[ax], ext_fine[ax], order)   # (fine, coarse)
+        arr = np.tensordot(M.T, arr, axes=([1], [ax]))   # contract fine → coarse
+        arr = np.moveaxis(arr, 0, ax)
+    return arr.astype(np.float32).reshape(-1)
+
+
 def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
              n_stages=3, steps=None, cg_iters=12, n_channels=NCH,
              periodic=(True, False, False, False), dispatch=True,
+             bpx=False, bpx_floor=1e-2, bpx_weight=0.0,
              ctx=None, verbose=True):
     """Fit a spline field from jet rows (array pair, or a save_rows path).
 
@@ -198,6 +217,11 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
     t0 = time.time()
     if isinstance(rows, (str, os.PathLike)):
         rows, ops = load_rows(rows)
+    if ops is not None:
+        # the ROW FILE declares how many channels its operators reference;
+        # the n_channels argument is only the fallback for a table that
+        # predates the field
+        n_channels = int(getattr(ops, "n_channels", n_channels))
     assert ops is not None and lo is not None and hi is not None
     own_ctx = ctx is None
     ctx = ctx or Context()
@@ -231,6 +255,16 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
     x, op, w, s, c = (a[row_order] for a in (x, op, w, s, c))
     x = np.ascontiguousarray(x)
 
+    # BPX: the ladder GRIDS become preconditioner LEVELS and the solve is ONE
+    # cold run at the finest of them. The stage schedule and its steps-per-stage
+    # split disappear; a scalar `steps` is then the TOTAL budget. Measured on the
+    # CFD phantom this beats the ladder at equal wall-clock AND at equal loss.
+    lv_grids = ()
+    if bpx:
+        lv_grids = tuple(grids)
+        grids = [grids[-1]]
+        steps = (int(sum(steps)),)
+
     coef, prev = None, None
     losses = []
     for si, (grid, n_steps) in enumerate(zip(grids, steps)):
@@ -258,6 +292,42 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
             term = EqRowTerm(ctx, bases, iw, ops)
             term.bind_batch(axes.encode(x), op, w, s, c)
             terms = [term]
+
+        if bpx:
+            from .bpx import BpxPreconditioner
+
+            def level_diag(g, tt=None):
+                """GN diagonal of the SAME row system rebuilt on grid g at
+                coef = 0 (a quadratic residual's Jacobian there is its linear
+                part alone). One BPX level; `tt` reuses a built term set."""
+                ax_l = Axes(lo, hi, g, periodic=periodic)
+                bs_l = ax_l.bases()
+                nl = int(np.prod(g)) * n_channels
+                own = tt is None
+                if own:
+                    iw_l = [g[k] / ext[k] for k in range(len(g))]
+                    tt = [EqRowTerm(ctx, bs_l, iw_l, ops)]
+                    tt[0].bind_batch(ax_l.encode(x), op, w, s, c)
+                zb = ctx.buffer(nl * 4); zb.zero()
+                db = ctx.buffer(nl * 4); db.zero()
+                for t_ in tt:
+                    t_.accumulate_diag(zb, db)
+                dmax = float(db.download(np.float32, nl).max()) + 1e-30
+                if own:
+                    tt = None                 # release the level's terms
+                return dict(ext=tuple(b.primal_extent for b in bs_l),
+                            diag=db, dmax=dmax, grid=g)
+
+            lv = [level_diag(g) for g in lv_grids[:-1]]
+            lv.append(level_diag(grid, tt=terms))
+            opt.set_preconditioner(BpxPreconditioner(
+                ctx, extents, n_channels, lv, floor_rel=bpx_floor,
+                level_weight=bpx_weight))
+            if verbose:
+                print(f"  [bpx] {len(lv)} levels "
+                      f"{[tuple(L['grid']) for L in lv]}, floor_rel="
+                      f"{bpx_floor:g}, alpha={bpx_weight:g}  "
+                      f"({time.time()-t0:.0f}s)", flush=True)
 
         loss_buf = ctx.buffer(4)
 

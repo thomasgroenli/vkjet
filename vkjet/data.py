@@ -144,7 +144,9 @@ def save_rows(path, rows, ops):
     import json
     arrays = ops.to_arrays()
     arrays.pop("kernels", None)
-    meta = json.dumps({"version": 1, "nch": 5, "slots": "jet2-v1",
+    meta = json.dumps({"version": 1,
+                       "nch": int(getattr(ops, "n_channels", 5)),
+                       "slots": "jet2-v1",
                        "units": "world", "ncpr": 8})
     np.savez_compressed(os.path.expanduser(path), rows=np.asarray(rows),
                         meta_json=np.asarray(meta), **arrays)
@@ -154,14 +156,20 @@ def load_rows(path):
     """→ (rows record array, OperatorTable)."""
     from .eqrow import OperatorTable
     z = np.load(os.path.expanduser(path), allow_pickle=False)
-    return z["rows"], OperatorTable.from_arrays(z)
+    nch = 5                                    # files predating the field
+    if "meta_json" in getattr(z, "files", []):
+        import json
+        nch = int(json.loads(str(z["meta_json"])).get("nch", 5))
+    return z["rows"], OperatorTable.from_arrays(z, n_channels=nch)
 
 
 def merge_row_sets(*sets):
     """Merge (rows, ops) sets into one; operators deduped by canonical form
     (name-independent), row op ids remapped."""
     from .eqrow import OperatorTable
-    merged = OperatorTable()
+    # a merged objective spans the widest channel count of its parts
+    merged = OperatorTable(n_channels=max(
+        int(getattr(o, "n_channels", 5)) for _, o in sets))
     keys = {}
     out_rows = []
     for rows, ops in sets:
@@ -179,7 +187,7 @@ def merge_row_sets(*sets):
     return np.concatenate(out_rows), merged
 
 
-def data_operator(ops=None, name="data", n_channels=5):
+def data_operator(ops=None, name="data", n_channels=5, target_cix=None):
     """Register the shared value-covector operator: r = Σ_ch c[ch]·f_ch − s.
     Payload c carries the per-row covector (beam direction, wall normal,
     e_θ, √w·e_I, ...). Returns (ops, op_id)."""
@@ -188,20 +196,32 @@ def data_operator(ops=None, name="data", n_channels=5):
         ops = OperatorTable()
     op_id = ops.add_op(name, lin=[(SLOT_VAL, ch, 1.0, ch)
                                   for ch in range(n_channels)],
-                       kernel="data")
+                       const=(() if target_cix is None
+                              else ((-1.0, int(target_cix)),)),
+                       kernel="data" if target_cix is None else "")
     return ops, op_id
 
 
-def rows_from_unified(x, d, s, nyquist=0.0, ops=None):
+def rows_from_unified(x, d, s, nyquist=0.0, ops=None, target_cix=None):
     """Convert legacy unified rows (x, d(≤5), s) — √w folded into d and s —
     into jet rows referencing the shared data operator (w=1, covector in the
     payload; exactly the same residual). Returns (rows, ops)."""
     d = np.asarray(d, np.float32).reshape(len(x), -1)
     dp = np.zeros((len(x), 5), np.float32)
     dp[:, :d.shape[1]] = d
-    ops, op_id = data_operator(ops)
-    rows = make_rows(x, np.full(len(x), op_id, np.int32),
-                     np.ones(len(x), np.float32), s, dp, nyquist)
+    ops, op_id = data_operator(ops, target_cix=target_cix)
+    if target_cix is None:
+        rows = make_rows(x, np.full(len(x), op_id, np.int32),
+                         np.ones(len(x), np.float32), s, dp, nyquist)
+    else:
+        # target rides payload slot target_cix; the row's s column is 0 and the
+        # residual is homogeneous (r = 0)
+        cp = np.zeros((len(x), int(target_cix) + 1), np.float32)
+        cp[:, :dp.shape[1]] = dp
+        cp[:, int(target_cix)] = np.asarray(s, np.float32)
+        rows = make_rows(x, np.full(len(x), op_id, np.int32),
+                         np.ones(len(x), np.float32),
+                         np.zeros(len(x), np.float32), cp, nyquist)
     return rows, ops
 
 
@@ -226,6 +246,9 @@ def rows_hash(rows, ops, fit_config=None):
         canon[f] = rows[f]
     canon = np.sort(canon, order=["k", "x", "w", "s"])
     h = hashlib.sha256(canon.tobytes())
+    # the channel count is part of the objective: the table references channel
+    # indices, so the same rows on a different NCH are a different experiment
+    h.update(f"|nch={int(getattr(ops, 'n_channels', 5))}".encode())
     if fit_config is not None:
         h.update(json.dumps(fit_config, sort_keys=True).encode())
     return h.hexdigest()

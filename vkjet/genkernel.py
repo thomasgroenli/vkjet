@@ -109,7 +109,8 @@ def structure_hash(ops: OperatorTable, k: int) -> str:
     identity, and as the ordering the emitters canonicalize on."""
     lin = sorted(_lin_key(e) for e in ops.lin[k])
     quad = sorted(_quad_key(q) for q in ops.quad[k])
-    key = f"jet2v1/nch{NCH}/gen{GEN_VERSION}/{lin}/{quad}".encode()
+    nch = int(getattr(ops, "n_channels", NCH))
+    key = f"jet2v1/nch{nch}/gen{GEN_VERSION}/{lin}/{quad}".encode()
     return hashlib.sha256(key).hexdigest()[:20]
 
 
@@ -196,11 +197,20 @@ def emit_shaders(ops: OperatorTable, k: int):
         raise ValueError(
             f"operator {ops.names[k]!r} has no entries — nothing to specialize "
             f"(residual is just -s; use the generic EqRowTerm)")
-    used_slots = sorted({e[0] for e in lin}
+    # ORDER-0 (SLOT_CONST) entries carry no field factor: they shift the
+    # residual and vanish from the Jacobian, so they take no gathered site
+    # (there is no jet slot 15 to gather) and no cotangent row.
+    lin_f = [(e, t) for e, t in enumerate(lin) if t[0] != NF]
+    lin_c = [(e, t) for e, t in enumerate(lin) if t[0] == NF]
+    if not lin_f and not quad:
+        raise ValueError(
+            f"operator {ops.names[k]!r} has only order-0 terms — its residual "
+            f"does not depend on the field, so its Jacobian is identically zero")
+    used_slots = sorted({t[0] for _, t in lin_f}
                         | {q[0] for q in quad} | {q[2] for q in quad})
-    sites = sorted({(e[0], e[1]) for e in lin}
+    sites = sorted({(t[0], t[1]) for _, t in lin_f}
                    | {(q[0], q[1]) for q in quad} | {(q[2], q[3]) for q in quad})
-    chans = sorted({e[1] for e in lin} | {q[1] for q in quad}
+    chans = sorted({t[1] for _, t in lin_f} | {q[1] for q in quad}
                    | {q[3] for q in quad})
     need_pd = any(1 <= s <= 4 or s >= 9 for s in used_slots)
     need_pq = any(5 <= s <= 8 for s in used_slots)
@@ -237,15 +247,16 @@ def emit_shaders(ops: OperatorTable, k: int):
               f"        combo(i,ii,fr,pob,prim,{wargs});\n{facc}\n    }}")
 
     # residual
-    rterms = [f"v{e}*f{sl}_{ch}" for e, (sl, ch, _, _) in enumerate(lin)]
+    rterms = [f"v{e}*f{t[0]}_{t[1]}" for e, t in lin_f]
+    rterms += [f"v{e}" for e, _ in lin_c]      # order-0: no field factor
     rterms += [f"v{len(lin)+j}*f{s1}_{c1}*f{s2}_{c2}"
                for j, (s1, c1, s2, c2, _, _) in enumerate(quad)]
     rexpr = " + ".join(rterms) if rterms else "0.0"
 
     # per-combo Jacobian row A_c for used channels
     aterms = {c: [] for c in chans}
-    for e, (sl, ch, _, _) in enumerate(lin):
-        aterms[ch].append(f"v{e}*W{sl}")
+    for e, t in lin_f:                          # lin_c has no Jacobian row
+        aterms[t[1]].append(f"v{e}*W{t[0]}")
     for j, (s1, c1, s2, c2, _, _) in enumerate(quad):
         e = len(lin) + j
         aterms[c1].append(f"v{e}*f{s2}_{c2}*W{s1}")
@@ -502,7 +513,8 @@ def verify_generated(ctx, term, bases, inv_widths, ops, k, seed=0, n=64,
     if not force and memo in _VERIFIED:
         return True
     rng = np.random.default_rng(seed)
-    nco = int(np.prod([b.primal_extent for b in bases])) * NCH
+    nco = int(np.prod([b.primal_extent for b in bases])) \
+        * int(getattr(ops, "n_channels", NCH))
     x_enc = verify_points(bases, rng, n)
     w = rng.uniform(0.5, 1.5, n).astype(np.float32)
     s = rng.standard_normal(n).astype(np.float32) * 0.1
@@ -847,7 +859,8 @@ def verify_grouped(ctx, term, bases, inv_widths, ops, ids, seed=0, n=48,
     if not force and memo in _VERIFIED:
         return True
     rng = np.random.default_rng(seed)
-    nco = int(np.prod([b.primal_extent for b in bases])) * NCH
+    nco = int(np.prod([b.primal_extent for b in bases])) \
+        * int(getattr(ops, "n_channels", NCH))
     xp = verify_points(bases, rng, n)
     m = len(ids)
     W = rng.uniform(0.5, 1.5, (n, m)).astype(np.float32)
