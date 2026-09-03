@@ -205,8 +205,7 @@ def multilinear_restrict(coef_fine: np.ndarray, ext_fine: Sequence[int],
 def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
              n_stages=3, steps=None, cg_iters=12, n_channels=NCH,
              periodic=(True, False, False, False), dispatch=True,
-             bpx=False, bpx_floor=1e-2, bpx_weight=0.0,
-             ctx=None, verbose=True):
+             bpx=False, ctx=None, verbose=True):
     """Fit a spline field from jet rows (array pair, or a save_rows path).
 
     dispatch=True  JIT-generated kernels, generic for anything they cannot take
@@ -320,13 +319,11 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
 
             lv = [level_diag(g) for g in lv_grids[:-1]]
             lv.append(level_diag(grid, tt=terms))
-            opt.set_preconditioner(BpxPreconditioner(
-                ctx, extents, n_channels, lv, floor_rel=bpx_floor,
-                level_weight=bpx_weight))
+            opt.set_preconditioner(
+                BpxPreconditioner(ctx, extents, n_channels, lv))
             if verbose:
                 print(f"  [bpx] {len(lv)} levels "
-                      f"{[tuple(L['grid']) for L in lv]}, floor_rel="
-                      f"{bpx_floor:g}, alpha={bpx_weight:g}  "
+                      f"{[tuple(L['grid']) for L in lv]}  "
                       f"({time.time()-t0:.0f}s)", flush=True)
 
         loss_buf = ctx.buffer(4)
