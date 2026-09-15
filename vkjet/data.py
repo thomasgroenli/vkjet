@@ -93,6 +93,7 @@ def save_unified(path, x, d, s, nyquist=0.0):
     a = np.empty(len(x), dt)
     a["x"], a["d"], a["s"] = x, d, np.asarray(s, np.float32)
     a["nyquist"] = nyquist
+    a["fuzz"] = fuzz
     np.save(os.path.expanduser(path), a)
 
 
@@ -116,10 +117,17 @@ def merge_rows(*rows):
 # Jet-row schema: data AND equations as rows in ONE file (vkjet.eqrow)        #
 # --------------------------------------------------------------------------- #
 ROW_DTYPE = np.dtype([("x", "<f4", (4,)), ("op", "<i4"), ("w", "<f4"),
-                      ("s", "<f4"), ("c", "<f4", (8,)), ("nyquist", "<f4")])
+                      ("s", "<f4"), ("c", "<f4", (8,)), ("nyquist", "<f4"),
+                      ("fuzz", "<f4")])
+# nyquist: the row's modulus m (> 0 asserts the congruence r = 0 mod m — an
+# aliased Doppler reading with m = 2*venc; 0 = the plain equality r = 0).
+# fuzz: per-row sigma, in CELL units, of a Gaussian jitter applied to the row's
+# evaluation point, redrawn once per optimiser step. A jittered row declares a
+# MEASURE about x rather than a sampled point (physics rows: a fixed
+# collocation set gets overfitted); data rows want fuzz = 0.
 
 
-def make_rows(x, op, w, s, c=None, nyquist=0.0):
+def make_rows(x, op, w, s, c=None, nyquist=0.0, fuzz=0.0):
     """Assemble a jet-row record array: point, operator id, absolute weight,
     RHS target, 8-float payload (per-row covectors etc.), nyquist."""
     x = np.asarray(x, np.float32)
@@ -160,7 +168,13 @@ def load_rows(path):
     if "meta_json" in getattr(z, "files", []):
         import json
         nch = int(json.loads(str(z["meta_json"])).get("nch", 5))
-    return z["rows"], OperatorTable.from_arrays(z, n_channels=nch)
+    r = z["rows"]
+    if "fuzz" not in (r.dtype.names or ()) or "nyquist" not in (r.dtype.names or ()):
+        out = np.zeros(len(r), ROW_DTYPE)           # files written before a column
+        for f in r.dtype.names:
+            out[f] = r[f]
+        r = out
+    return r, OperatorTable.from_arrays(z, n_channels=nch)
 
 
 def merge_row_sets(*sets):
@@ -240,11 +254,17 @@ def rows_hash(rows, ops, fit_config=None):
     opk = np.asarray([hashlib.sha256(k).hexdigest()[:16] for k in keys])
     canon = np.zeros(len(rows), dtype=[("k", "U16"), ("x", "<f4", (4,)),
                                        ("w", "<f4"), ("s", "<f4"),
-                                       ("c", "<f4", (8,))])
+                                       ("c", "<f4", (8,)), ("m", "<f4"),
+                                       ("fz", "<f4")])
     canon["k"] = opk[rows["op"]]
     for f in ("x", "w", "s", "c"):
         canon[f] = rows[f]
-    canon = np.sort(canon, order=["k", "x", "w", "s"])
+    names = rows.dtype.names or ()
+    # the modulus and the jitter ARE part of the objective (a congruence is
+    # not an equality; a jittered row declares a measure, not a point)
+    canon["m"] = rows["nyquist"] if "nyquist" in names else 0.0
+    canon["fz"] = rows["fuzz"] if "fuzz" in names else 0.0
+    canon = np.sort(canon, order=["k", "x", "w", "s", "m", "fz"])
     h = hashlib.sha256(canon.tobytes())
     # the channel count is part of the objective: the table references channel
     # indices, so the same rows on a different NCH are a different experiment

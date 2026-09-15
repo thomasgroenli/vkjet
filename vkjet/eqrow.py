@@ -45,6 +45,7 @@ EQROW_HVP_SPV = os.path.join(SHADER_DIR, "eqrow_hvp.spv")
 NF = 15
 NCH = 5
 NCPR = 8                      # per-row payload floats
+ROWREC = 5                    # ints per row record: op, w, s, fuzz, modulus
 SLOT_VAL = 0
 SLOT_DT, SLOT_DX, SLOT_DY, SLOT_DZ = 1, 2, 3, 4
 SLOT_DTT, SLOT_DXX, SLOT_DYY, SLOT_DZZ = 5, 6, 7, 8
@@ -52,13 +53,13 @@ SLOT_DTX, SLOT_DTY, SLOT_DTZ = 9, 10, 11
 SLOT_DXY, SLOT_DXZ, SLOT_DYZ = 12, 13, 14
 # The ORDER-0 term of the same polynomial. A residual is
 #     r = c0 + <L, J(f)> + J'QJ
-# and the table carried order-1 (lin) and order-2 (quad) as entries while
-# order-0 lived as a per-row `s` scalar with a hardcoded minus sign.
-# SLOT_CONST is a linear entry with NO FIELD FACTOR, so the constant becomes
-# just another term of the series and its value rides the payload like every
-# other per-row coefficient. Slot 15 is free in the pack format
-# (slot<<8 | ch<<4 | cix+1, real slots 0..14), so this costs no new table
-# section, no meta field and no ABI change.
+# and the schema carried order-1 (lin) and order-2 (quad) as table entries while
+# order-0 lived as a per-row `s` scalar with a hardcoded minus sign. SLOT_CONST
+# is a linear entry with NO FIELD FACTOR, so the constant becomes just another
+# term of the series: its value rides the payload like every other per-row
+# coefficient (covectors, weights), and the residual is uniformly = 0. Slot 15
+# is free in the pack format (slot<<8 | ch<<4 | cix+1, real slots 0..14), so
+# this needs no new table section, no meta field and no ABI change.
 SLOT_CONST = NF
 MIXED_PAIRS = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
 SLOT_NAMES = ["val", "dt", "dx", "dy", "dz", "dtt", "dxx", "dyy", "dzz",
@@ -75,8 +76,9 @@ class OperatorTable:
 
     def __init__(self, n_channels=NCH):
         # The table REFERENCES channel indices, so the objective it defines is
-        # not well posed without a channel count: it belongs to the row file
-        # alongside the operators, not to the solver.
+        # not well posed without a channel count — which makes n_channels part
+        # of the semantic specification, carried by the row file alongside the
+        # operators themselves (data.save_rows / load_rows), not a solver knob.
         self.n_channels = int(n_channels)
         self.names = []
         self.lin = []            # per op: list[(slot, ch, val, cix)]
@@ -95,8 +97,8 @@ class OperatorTable:
 
     def add_op(self, name, lin=(), quad=(), kernel="", const=()):
         """const: [(val, cix), ...] — order-0 terms. cix < 0 is a literal
-        constant; cix >= 0 multiplies by payload slot cix, which is how a
-        per-row target/source is expressed without an `s` column."""
+        constant; cix >= 0 multiplies by the row's payload slot cix, which is
+        how a per-row target/source is expressed without an `s` column."""
         L, Q = [], []
         for e in const:
             val = float(e[0]); cix = int(e[1]) if len(e) > 1 else -1
@@ -215,6 +217,58 @@ def gather_fields_jet(bases, iw, x_enc, C):
     return out
 
 
+def soft_unwrap(r, m, tau):
+    """Wrapped-Gaussian pseudo-residual r~ (float64 oracle of the GLSL
+    softwrap): rows with m > 0 assert r ≡ 0 (mod m). Periodic form — r is
+    wrapped to [-m/2, m/2] first, then the three branches k ∈ {-1, 0, 1} are
+    marginalised at temperature sigma = tau·m (decoupled: the GN weight of the
+    row is untouched, tau only softens the branch posterior). m <= 0 → r.
+    tau < 0 selects the pure cosine loss (m/2π)²(1−cos(2πr/m)) instead."""
+    r = np.asarray(r, np.float64).copy()
+    m = np.broadcast_to(np.asarray(m, np.float64), r.shape)
+    on = m > 0
+    if not on.any():
+        return r
+    mm = m[on]
+    if tau < 0:                       # pure cosine (first harmonic only)
+        k = 2 * np.pi / mm
+        r[on] = np.sin(k * r[on]) / k
+        return r
+    rr = r[on] - mm * np.round(r[on] / mm)
+    s2 = np.maximum((tau * mm) ** 2, (1e-3 * mm) ** 2)
+    u = np.stack([rr - mm, rr, rr + mm], 0)
+    e = -0.5 * u * u / s2
+    e -= e.max(0)
+    w = np.exp(e)
+    r[on] = (w * u).sum(0) / w.sum(0)
+    return r
+
+
+def wrapped_half_sq(r, m, tau):
+    """Row loss oracle: ½·r² for m <= 0; for m > 0 the wrapped-Gaussian value
+    -sigma²·log Σ_k exp(-u_k²/2sigma²) (wrapped first), whose derivative in r
+    is exactly soft_unwrap and whose tau → 0 limit is ½·wrap(r)²."""
+    r = np.asarray(r, np.float64)
+    m = np.broadcast_to(np.asarray(m, np.float64), r.shape)
+    out = 0.5 * r * r
+    on = m > 0
+    if on.any():
+        mm = m[on]
+        if tau < 0:
+            k = 2 * np.pi / mm
+            out = out.copy()
+            out[on] = (1.0 - np.cos(k * r[on])) / (k * k)
+            return out
+        rr = r[on] - mm * np.round(r[on] / mm)
+        s2 = np.maximum((tau * mm) ** 2, (1e-3 * mm) ** 2)
+        u = np.stack([rr - mm, rr, rr + mm], 0)
+        e = -0.5 * u * u / s2
+        emax = e.max(0)
+        out = out.copy()
+        out[on] = -s2 * (emax + np.log(np.exp(e - emax).sum(0)))
+    return out
+
+
 def row_residuals_oracle(fields, ops, op, w, s, c):
     """fields (N,15,NCH) → residuals r (N,) per the operator table."""
     n = len(fields)
@@ -231,19 +285,24 @@ def row_residuals_oracle(fields, ops, op, w, s, c):
     return r
 
 
-def row_loss_oracle(bases, iw, x_enc, C, ops, op, w, s, c, scale=1.0):
+def row_loss_oracle(bases, iw, x_enc, C, ops, op, w, s, c, scale=1.0,
+                    modulus=None, tau=0.0):
     fields = gather_fields_jet(bases, iw, x_enc, np.asarray(C, np.float64))
     r = row_residuals_oracle(fields, ops, op, w, s, c)
-    return float(0.5 * scale * np.sum(np.asarray(w, np.float64) * r * r))
+    m = 0.0 if modulus is None else modulus
+    return float(scale * np.sum(np.asarray(w, np.float64)
+                                * wrapped_half_sq(r, m, tau)))
 
 
 # --------------------------------------------------------------------------- #
 # GPU term                                                                    #
 # --------------------------------------------------------------------------- #
-_META_EQ_INTS = 8 + 9 * MAX_NDIM
+# 8 scalars + 9 per-dim tables + the wrapped-row temperature tau (float bits)
+_META_EQ_INTS = 8 + 9 * MAX_NDIM + 1
 
 
-def pack_eqrow_meta(bases, n_samples, scale, n_ops, nnz_lin, n_channels=NCH):
+def pack_eqrow_meta(bases, n_samples, scale, n_ops, nnz_lin, seed=0,
+                    n_channels=NCH, tau=0.0):
     nd = len(bases)
     order = [b.order for b in bases]
     extents = [b.primal_extent for b in bases]
@@ -252,7 +311,7 @@ def pack_eqrow_meta(bases, n_samples, scale, n_ops, nnz_lin, n_channels=NCH):
     m[0] = nd; m[1] = n_samples; m[2] = int(n_channels)
     m[3] = int(np.prod(order))
     m[4] = np.float32(scale).view(np.int32)
-    m[5] = n_ops; m[6] = nnz_lin
+    m[5] = n_ops; m[6] = nnz_lin; m[7] = int(seed) & 0x7fffffff
 
     def put(slot, vals):
         base = 8 + slot * MAX_NDIM
@@ -261,6 +320,7 @@ def pack_eqrow_meta(bases, n_samples, scale, n_ops, nnz_lin, n_channels=NCH):
     put(2, [b.degp1 for b in bases]); put(3, [b.stride for b in bases])
     put(4, [b.table_period for b in bases]); put(5, extents)
     put(6, pstride); put(7, _coef_offsets(bases)); put(8, _table_offsets(bases))
+    m[8 + 9 * MAX_NDIM] = np.float32(tau).view(np.int32)
     return m.tobytes()
 
 
@@ -308,8 +368,13 @@ class EqRowTerm:
         self.optab_i = ctx.buffer(max(oi.nbytes, 4)); self.optab_i.upload(oi)
         self.optab_f = ctx.buffer(max(of.nbytes, 4)); self.optab_f.upload(of)
         self._batch = None
+        self.minibatches = []       # bucketed sub-batches (bind_buckets)
 
-    def bind_batch(self, x_enc, op, w, s, c, scale=1.0):
+    def _make_batch(self, x_enc, op, w, s, c, scale=1.0, fuzz=None,
+                    modulus=None):
+        """Build a persistent device batch from host arrays. Split out of
+        bind_batch so a bucketed row set can hold several of them (see
+        bind_buckets) without the solver knowing."""
         ctx = self.ctx
         x_enc = np.ascontiguousarray(x_enc, np.float32)
         n = x_enc.shape[0]
@@ -322,53 +387,131 @@ class EqRowTerm:
         if c is not None:
             c = np.asarray(c, np.float32).reshape(n, -1)
             cpad[:, :c.shape[1]] = c
-        rr = np.zeros((n, 4), np.int32)
+        # row record {op, w, s, fuzz, m}: slot 3 carries the per-row jitter
+        # sigma; slot 4 the wrap modulus m of the congruence r ≡ 0 (mod m)
+        # (0 = exact row). Both ride the record so neither costs a binding.
+        rr = np.zeros((n, ROWREC), np.int32)
         rr[:, 0] = op
         rr[:, 1] = w.view(np.int32)
         rr[:, 2] = s.view(np.int32)
+        if fuzz is not None:
+            fz = np.ascontiguousarray(fuzz, np.float32).reshape(-1)
+            assert fz.size == n, (fz.size, n)
+            rr[:, 3] = fz.view(np.int32)
+        if modulus is not None:
+            mm = np.ascontiguousarray(modulus, np.float32).reshape(-1)
+            assert mm.size == n, (mm.size, n)
+            rr[:, 4] = mm.view(np.int32)
+        tau = float(getattr(self, "tau", 0.0))
         meta_b = pack_eqrow_meta(self.bases, n, scale, self.n_ops,
-                                 self.nnz_lin, n_channels=self.nch)
+                                 self.nnz_lin, 0, n_channels=self.nch, tau=tau)
         xb = ctx.buffer(x_enc.nbytes); xb.upload(x_enc.reshape(-1))
         mb = ctx.buffer(len(meta_b), device_local=False); mb.upload(meta_b)
         rrb = ctx.buffer(rr.nbytes); rrb.upload(rr.reshape(-1))
         rcb = ctx.buffer(cpad.nbytes); rcb.upload(cpad.reshape(-1))
-        self._batch = dict(n=n, xb=xb, mb=mb, rrb=rrb, rcb=rcb, scale=scale)
+        return dict(n=n, xb=xb, mb=mb, rrb=rrb, rcb=rcb, scale=scale, seed=0,
+                    tau=tau)
+
+    def bind_batch(self, x_enc, op, w, s, c, scale=1.0, fuzz=None,
+                   modulus=None):
+        self._batch = self._make_batch(x_enc, op, w, s, c, scale, fuzz, modulus)
+        self.minibatches = [self._batch]
         return self
 
-    def set_scale(self, scale):
-        b = self._batch
-        assert b is not None, "call bind_batch first"
-        b["scale"] = float(scale)
+    def bind_buckets(self, x_enc, op, w, s, c, buckets, scale=1.0, fuzz=None,
+                     modulus=None):
+        """Bind the full row set AND one sub-batch per bucket.
+
+        `buckets` is a list of index arrays partitioning range(n) — the LOCAL
+        view of a global bucket assignment, so minibatch k of every term refers
+        to the same slice of the one row system. K=1 aliases the full batch
+        (same object, no copy), which is what makes the full solve a literal
+        special case rather than a parallel path.
+
+        Costs a second copy of the row data on the device (the union batch plus
+        the buckets) for K>1; at 64 B/row that is the price of arbitrary bucket
+        membership without an offset field in the shader meta.
+        """
+        self.bind_batch(x_enc, op, w, s, c, scale, fuzz, modulus)
+        if len(buckets) == 1:
+            assert len(buckets[0]) == self._batch["n"], "K=1 must be the whole set"
+            self.minibatches = [self._batch]
+            return self
+        sl = lambda a, ix: (None if a is None else np.asarray(a)[ix])
+        self.minibatches = [
+            self._make_batch(np.asarray(x_enc)[ix], sl(op, ix), sl(w, ix),
+                             sl(s, ix), sl(c, ix), scale, sl(fuzz, ix),
+                             sl(modulus, ix))
+            for ix in buckets]
+        return self
+
+    def _all_batches(self):
+        seen, out = set(), []
+        for b in [self._batch] + list(getattr(self, "minibatches", ())):
+            if b is not None and id(b) not in seen:
+                seen.add(id(b)); out.append(b)
+        return out
+
+    def set_seed(self, seed):
+        """Advance the jitter draw. Call ONCE PER OPTIMISER STEP, never per
+        dispatch: every loss/grad/diag/hvp inside one step must see the same
+        perturbed points or the line search and CG are solving different
+        problems. A no-op for terms with no fuzzed rows."""
+        for b in self._all_batches():
+            if b.get("seed") == int(seed):
+                continue
+            b["seed"] = int(seed)
+            self._upload_meta(b)
+
+    def _upload_meta(self, b):
         b["mb"].upload(pack_eqrow_meta(self.bases, b["n"], b["scale"],
                                        self.n_ops, self.nnz_lin,
-                                       n_channels=self.nch))
+                                       b.get("seed", 0), n_channels=self.nch,
+                                       tau=b.get("tau", 0.0)))
+
+    def set_scale(self, scale):
+        assert self._batch is not None, "call bind_batch first"
+        for b in self._all_batches():
+            b["scale"] = float(scale)
+            self._upload_meta(b)
+
+    def set_tau(self, tau):
+        """Temperature of the wrapped rows' branch posterior, sigma = tau·m
+        per row. Constant for now (no schedule); a no-op for rows with m = 0.
+        Stored on the term so later binds inherit it."""
+        self.tau = float(tau)
+        for b in self._all_batches():
+            if b.get("tau") == self.tau:
+                continue
+            b["tau"] = self.tau
+            self._upload_meta(b)
 
     def _spec(self):
         return {0: self.spec_stride, 1: self.spec_tper, 2: self.nch}
 
-    def _shared(self, coef_buf):
-        b = self._batch
+    def _shared(self, coef_buf, b=None):
+        b = self._batch if b is None else b
         return [b["mb"], b["xb"], coef_buf, self.coefs_buf, self.table_buf,
                 self.dcoefs_buf, self.ddcoefs_buf, b["rrb"], b["rcb"],
                 self.optab_i, self.optab_f]
 
-    def accumulate(self, coef_buf, grad_buf):
-        b = self._batch
-        self.ctx.run(self.grad_program, self._shared(coef_buf) + [grad_buf],
+    def accumulate(self, coef_buf, grad_buf, batch=None):
+        b = self._batch if batch is None else batch
+        self.ctx.run(self.grad_program, self._shared(coef_buf, b) + [grad_buf],
                      groups=(b["n"] + 255) // 256, spec=self._spec())
 
-    def accumulate_diag(self, coef_buf, diag_buf):
-        b = self._batch
-        self.ctx.run(self.diag_program, self._shared(coef_buf) + [diag_buf],
+    def accumulate_diag(self, coef_buf, diag_buf, batch=None):
+        b = self._batch if batch is None else batch
+        self.ctx.run(self.diag_program, self._shared(coef_buf, b) + [diag_buf],
                      groups=(b["n"] + 255) // 256, spec=self._spec())
 
-    def hvp(self, coef_buf, v_buf, out_buf):
-        b = self._batch
+    def hvp(self, coef_buf, v_buf, out_buf, batch=None):
+        b = self._batch if batch is None else batch
         self.ctx.run(self.hvp_program,
-                     self._shared(coef_buf) + [v_buf, out_buf],
+                     self._shared(coef_buf, b) + [v_buf, out_buf],
                      groups=(b["n"] + 255) // 256, spec=self._spec())
 
-    def loss(self, coef_buf, loss_buf):
-        b = self._batch
-        self.ctx.run(self.loss_program, self._shared(coef_buf) + [loss_buf],
+    def loss(self, coef_buf, loss_buf, batch=None):
+        b = self._batch if batch is None else batch
+        self.ctx.run(self.loss_program, self._shared(coef_buf, b) + [loss_buf],
                      groups=(b["n"] + 255) // 256, spec=self._spec())

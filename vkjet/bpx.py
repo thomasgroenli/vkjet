@@ -121,8 +121,16 @@ class BpxPreconditioner:
     levels: [{ext: tuple, diag: device buffer (prod(ext)·nch), dmax: float}],
     any order; the level whose ext == ext_fine is the identity (no transfer)."""
 
-    def __init__(self, ctx: Context, ext_fine, n_channels, levels, order=4):
+    def __init__(self, ctx: Context, ext_fine, n_channels, levels, order=4,
+                 floor_rel=FLOOR_REL):
+        """floor_rel: per-level damping RELATIVE to that level's max diagonal.
+        A division guard against the unobserved directions of the diagonal —
+        NOT a regulariser: the answer must not depend on it (regularisation is
+        rows). It also bounds how far a diagonal preconditioner amplifies a
+        weakly observed channel; a channel that needs more than a guard needs
+        a row (see vkflow docs: acquisition-frame channels)."""
         self.ctx = ctx; self.nch = int(n_channels); self.levels = levels
+        self.floor_rel = float(floor_rel)
         self.ext_f = tuple(int(v) for v in ext_fine)
         n_f = int(np.prod(self.ext_f))
         self.pdiv_prog = ctx.program(VEC_PDIV_SPV, bindings=[STORAGE] * 4)
@@ -134,7 +142,7 @@ class BpxPreconditioner:
         for L in levels:
             L["ext"] = tuple(int(v) for v in L["ext"])
             L["nl"] = int(np.prod(L["ext"])) * self.nch
-            L["floor"] = FLOOR_REL * L["dmax"]
+            L["floor"] = self.floor_rel * L["dmax"]
             if L["ext"] == self.ext_f:
                 L["T"] = None
             else:

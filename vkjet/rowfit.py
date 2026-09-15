@@ -46,7 +46,7 @@ from .apply import ApplyForward
 from .context import Context
 from .data import Axes, load_rows
 from .eqrow import OperatorTable, EqRowTerm, NCH
-from .optim import GaussNewtonCG
+from .optim import GaussNewtonCG, _MaxReduce
 
 
 # --------------------------------------------------------------------------- #
@@ -110,12 +110,19 @@ class FitResult:
 # --------------------------------------------------------------------------- #
 # execution-tier selection (semantics-preserving)                             #
 # --------------------------------------------------------------------------- #
-def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose):
+def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose,
+               fuzz=None, modulus=None):
     """Compile a specialised kernel per operator where possible.
 
     Payload-free operators that share an IDENTICAL point set fuse into one
     shared-gather kernel; the rest get a per-operator kernel. Returns
     (terms, handled_mask); anything not handled is left to the generic term.
+
+    Wrapped rows (modulus m > 0: r = 0 mod m) and jittered rows (fuzz > 0)
+    ride the per-row record. The grouped kernel carries no modulus, so an
+    operator with any wrapped row stays off it (silently treating a congruence
+    as an equality would change the objective); it carries ONE sigma per point,
+    so co-located operators must agree on sigma or they go per-op.
     """
     handled = np.zeros(len(x), bool)
     terms = []
@@ -131,11 +138,15 @@ def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose):
             print("    [dispatch] no glslc/glslangValidator — generic only",
                   flush=True)
         return terms, handled
+    fz = None if fuzz is None else np.ascontiguousarray(fuzz, np.float32).reshape(-1)
+    mm = None if modulus is None else np.ascontiguousarray(modulus, np.float32).reshape(-1)
+    wrap_ops = set() if mm is None else {int(k) for k in np.unique(op[mm > 0])}
 
     # --- grouped: payload-free ops on a shared point set -------------------- #
     payload_free = [
         int(k) for k in np.unique(op)
-        if all(e[3] < 0 for e in ops.lin[k]) and all(q[5] < 0 for q in ops.quad[k])]
+        if all(e[3] < 0 for e in ops.lin[k]) and all(q[5] < 0 for q in ops.quad[k])
+        and k not in wrap_ops]
     sig = {}
     for k in payload_free:
         rows = np.flatnonzero(op == k)
@@ -147,13 +158,23 @@ def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose):
             continue
         members = sorted(members, key=lambda t: t[0])
         gids = [k for k, _ in members]
+        sg = None
+        if fz is not None and any((fz[srt] > 0).any() for _, srt in members):
+            cols = [fz[srt] for _, srt in members]
+            if not all(np.array_equal(cols[0], cc) for cc in cols[1:]):
+                if verbose:
+                    print(f"    [dispatch] jit-group {[ops.names[k] for k in gids]}: "
+                          f"sigma differs between co-located rows — per-op",
+                          flush=True)
+                continue
+            sg = cols[0]
         try:
             gt = GroupedRowTerm(ctx, bases, iw, ops, gids, compiler=comp)
             verify_grouped(ctx, gt, bases, iw, ops, gids)
             xp = x[members[0][1]]
             W = np.stack([w[r] for _, r in members], 1)
             S = np.stack([s[r] for _, r in members], 1)
-            gt.bind_points(axes.encode(xp), W, S)
+            gt.bind_points(axes.encode(xp), W, S, sigma=sg)
             terms.append(gt)
             for _, r in members:
                 handled[r] = True
@@ -173,13 +194,19 @@ def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose):
             gt = GeneratedRowTerm(ctx, bases, iw, ops, int(k), compiler=comp)
             verify_generated(ctx, gt, bases, iw, ops, int(k))
             gt.bind_batch(axes.encode(x[m]), np.zeros(int(m.sum()), np.int32),
-                          w[m], s[m], c[m])
+                          w[m], s[m], c[m],
+                          fuzz=(None if fz is None else fz[m]),
+                          modulus=(None if mm is None else mm[m]))
             terms.append(gt)
             handled |= m
         except Exception as ex:
             if verbose:
                 print(f"    [dispatch] jit '{ops.names[int(k)]}' failed "
                       f"({type(ex).__name__}: {ex}) — generic", flush=True)
+    if verbose and wrap_ops:
+        print(f"    [dispatch] wrapped ops {sorted(wrap_ops)} "
+              f"({int((mm > 0).sum()):,} rows with m > 0) on the per-row "
+              f"record path", flush=True)
     return terms, handled
 
 
@@ -205,39 +232,71 @@ def multilinear_restrict(coef_fine: np.ndarray, ext_fine: Sequence[int],
 def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
              n_stages=3, steps=None, cg_iters=12, n_channels=NCH,
              periodic=(True, False, False, False), dispatch=True,
-             bpx=False, ctx=None, verbose=True):
+             resample_every=0, bpx=False, bpx_floor=1e-2,
+             tau=0.0, tau_end=None, init=None, callback=None, seed=0,
+             ctx=None, verbose=True):
     """Fit a spline field from jet rows (array pair, or a save_rows path).
 
+    `rows` may also be a CALLABLE grid -> (rows, ops): it is asked once per
+    stage for the rows appropriate to that grid, and with ``resample_every=k``
+    again every k steps within a stage, so an author can rotate a collocation
+    set (or re-author any row family) during the solve. fit_rows solves
+    exactly what it is handed each time.
+
     dispatch=True  JIT-generated kernels, generic for anything they cannot take
+                   ("jit" is accepted as a synonym)
     dispatch=False pure generic EqRowTerm (the semantic reference)
+
+    BPX (bpx=True): the ladder grids become preconditioner LEVELS and the
+    solve is ONE cold run at the finest of them; a scalar `steps` is then the
+    total budget. `bpx_floor` is each level's damping relative to its own max
+    diagonal — a division guard, not a regulariser (regularisation is rows).
+
+    WRAPPED ROWS: a row whose `nyquist` column is m > 0 asserts the congruence
+    r = 0 (mod m). Its loss is the wrapped Gaussian (branches k in {-1,0,1} at
+    temperature sigma = tau*m); under GN it is soft EM, so no unwrapping
+    precedes the solve. `tau` is constant unless `tau_end` is given (linear
+    anneal over each stage's steps); tau = 0 is the hard sawtooth, tau < 0 the
+    pure cosine. Rows with m = 0 are the plain equality.
+
+    JITTERED ROWS: a row with `fuzz` = sigma > 0 (cell units) is evaluated at
+    x + N(0, sigma^2), redrawn once per step (one draw shared by every dispatch
+    of that step).
+
+    `init` = (coef, grid): warm-start the first stage from a field on another
+    grid (resized as the ladder does between stages). `callback(grid, step,
+    opt)` runs after every accepted step. A fixed step budget is the
+    convergence rule here; stopping at stabilisation is the open item.
 
     Returns a :class:`FitResult`.
     """
     t0 = time.time()
+    per_stage = callable(rows)
     if isinstance(rows, (str, os.PathLike)):
         rows, ops = load_rows(rows)
+    assert lo is not None and hi is not None
+    assert per_stage or ops is not None
     if ops is not None:
-        # the ROW FILE declares how many channels its operators reference;
-        # the n_channels argument is only the fallback for a table that
-        # predates the field
         n_channels = int(getattr(ops, "n_channels", n_channels))
-    assert ops is not None and lo is not None and hi is not None
     own_ctx = ctx is None
     ctx = ctx or Context()
-
-    x = np.ascontiguousarray(rows["x"], np.float32)
-    op = np.ascontiguousarray(rows["op"], np.int32)
-    w = np.ascontiguousarray(rows["w"], np.float32)
-    s = np.ascontiguousarray(rows["s"], np.float32)
-    c = np.ascontiguousarray(rows["c"], np.float32)
+    if dispatch == "jit":
+        dispatch = True
 
     grids = [tuple(g * (1 << k) if g > 1 else 1 for g in base_grid)
              for k in range(n_stages)]
     if steps is None:
         steps = (25, 25, 30, 25, 25)[:n_stages]
+    lv_grids = ()
+    if bpx:
+        lv_grids = tuple(grids)
+        grids = [grids[-1]]
+        steps = ((int(steps),) if np.isscalar(steps)
+                 else (int(sum(steps)),))
     if np.isscalar(steps):
         steps = (int(steps),) * n_stages
     ext = np.asarray(hi, np.float64) - np.asarray(lo, np.float64)
+    nd = len(ext)
 
     def cell_ids(pts, grid):
         ax = Axes(lo, hi, grid, periodic=periodic)
@@ -247,50 +306,89 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
             cid = cid * g + np.clip(e[:, k], 0, g - 1)
         return cid
 
-    # one finest-grid stable sort by (cell, op): scatter locality at every
-    # coarser stage (dyadic) + warp-uniform operator ids inside cells
-    key = cell_ids(x, grids[-1]) * (ops.n_ops + 1) + op
-    row_order = np.argsort(key, kind="stable")
-    x, op, w, s, c = (a[row_order] for a in (x, op, w, s, c))
-    x = np.ascontiguousarray(x)
+    def unpack(rws, ops_, sort_grid):
+        """Row arrays + one stable (cell, op) sort: scatter locality plus
+        warp-uniform operator ids inside a cell."""
+        names = rws.dtype.names or ()
+        xx = np.ascontiguousarray(rws["x"], np.float32)
+        oo = np.ascontiguousarray(rws["op"], np.int32)
+        ww = np.ascontiguousarray(rws["w"], np.float32)
+        ss = np.ascontiguousarray(rws["s"], np.float32)
+        cc = np.ascontiguousarray(rws["c"], np.float32)
+        ff = (np.ascontiguousarray(rws["fuzz"], np.float32) if "fuzz" in names
+              else np.zeros(len(rws), np.float32))
+        mq = (np.ascontiguousarray(rws["nyquist"], np.float32) if "nyquist" in names
+              else np.zeros(len(rws), np.float32))
+        key = cell_ids(xx, sort_grid) * (ops_.n_ops + 1) + oo
+        order = np.argsort(key, kind="stable")
+        xx, oo, ww, ss, cc, ff, mq = (a[order] for a in (xx, oo, ww, ss, cc, ff, mq))
+        return np.ascontiguousarray(xx), oo, ww, ss, cc, ff, mq, order
 
-    # BPX: the ladder GRIDS become preconditioner LEVELS and the solve is ONE
-    # cold run at the finest of them. The stage schedule and its steps-per-stage
-    # split disappear; a scalar `steps` is then the TOTAL budget. Measured on the
-    # CFD phantom this beats the ladder at equal wall-clock AND at equal loss.
-    lv_grids = ()
-    if bpx:
-        lv_grids = tuple(grids)
-        grids = [grids[-1]]
-        steps = (int(sum(steps)),)
+    def make_terms(ax_, bs_, g, xx, oo, ww, ss, cc, ff, mq, ops_, verbose_):
+        """Terms for one row set on grid g (JIT where possible, generic rest)."""
+        iw_ = [g[k] / ext[k] for k in range(nd)]
+        if dispatch:
+            tt, hd = _jit_terms(ctx, ax_, bs_, g, xx, oo, ww, ss, cc, ops_, iw_,
+                                verbose_, fuzz=ff, modulus=mq)
+            if not hd.all():
+                gen = EqRowTerm(ctx, bs_, iw_, ops_)
+                r = ~hd
+                gen.bind_batch(ax_.encode(xx[r]), oo[r], ww[r], ss[r], cc[r],
+                               fuzz=ff[r], modulus=mq[r])
+                tt.append(gen)
+            if verbose_:
+                print(f"    [dispatch] jit {int(hd.sum()):,}  "
+                      f"generic {int((~hd).sum()):,}", flush=True)
+        else:
+            t_ = EqRowTerm(ctx, bs_, iw_, ops_)
+            t_.bind_batch(ax_.encode(xx), oo, ww, ss, cc, fuzz=ff, modulus=mq)
+            tt = [t_]
+        return tt
 
+    if not per_stage:
+        x, op, w, s, c, fz, mq, row_order = unpack(rows, ops, grids[-1])
     coef, prev = None, None
+    if init is not None:
+        coef = np.ascontiguousarray(init[0], np.float32).reshape(-1)
+        prev = tuple(int(g) for g in init[1])
+        assert coef.size == int(np.prod(prev)) * n_channels, (coef.size, prev)
+        if verbose:
+            print(f"  [init] warm start from a {prev} field", flush=True)
     losses = []
     for si, (grid, n_steps) in enumerate(zip(grids, steps)):
+        if per_stage:
+            stage_rows, ops = rows(grid)
+            n_channels = int(getattr(ops, "n_channels", n_channels))
+            x, op, w, s, c, fz, mq, row_order = unpack(stage_rows, ops, grid)
+            if verbose:
+                print(f"  [rows] {len(x):,} rows for {grid}", flush=True)
         axes = Axes(lo, hi, grid, periodic=periodic)
         bases = axes.bases()
         extents = tuple(b.primal_extent for b in bases)
         n = int(np.prod(grid)) * n_channels
-        iw = [grid[k] / ext[k] for k in range(len(grid))]   # pure chain rule
         coef = (np.zeros(n, np.float32) if coef is None
                 else multilinear_resize(coef, prev, grid, n_channels))
         opt = GaussNewtonCG(ctx, n); opt.set_coef(coef)
+        _tau_now = [float(tau)]
+        _first = [True]
 
-        if dispatch:
-            terms, handled = _jit_terms(ctx, axes, bases, grid, x, op, w, s, c,
-                                        ops, iw, verbose and si == 0)
-            if not handled.all():
-                gen = EqRowTerm(ctx, bases, iw, ops)
-                r = ~handled
-                gen.bind_batch(axes.encode(x[r]), op[r], w[r], s[r], c[r])
-                terms.append(gen)
-            if verbose and si == 0:
-                print(f"    [dispatch] jit {int(handled.sum()):,}  "
-                      f"generic {int((~handled).sum()):,}", flush=True)
-        else:
-            term = EqRowTerm(ctx, bases, iw, ops)
-            term.bind_batch(axes.encode(x), op, w, s, c)
-            terms = [term]
+        def build_terms():
+            tt = make_terms(axes, bases, grid, x, op, w, s, c, fz, mq, ops,
+                            verbose and si == 0 and _first[0])
+            _first[0] = False
+            for t_ in tt:
+                if hasattr(t_, "set_tau"):
+                    t_.set_tau(_tau_now[0])
+            return tt
+
+        terms = build_terms()
+        if verbose and si == 0 and (mq > 0).any():
+            print(f"  [wrap] {int((mq > 0).sum()):,} rows with modulus m > 0 "
+                  f"(m in [{float(mq[mq > 0].min()):g}, {float(mq[mq > 0].max()):g}]), "
+                  f"tau={tau:g}"
+                  + (f" -> {tau_end:g} (linear anneal over {n_steps} steps)"
+                     if tau_end is not None else " constant")
+                  + " (sigma = tau*m); no unwrap precedes the solve", flush=True)
 
         if bpx:
             from .bpx import BpxPreconditioner
@@ -304,14 +402,21 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
                 nl = int(np.prod(g)) * n_channels
                 own = tt is None
                 if own:
-                    iw_l = [g[k] / ext[k] for k in range(len(g))]
-                    tt = [EqRowTerm(ctx, bs_l, iw_l, ops)]
-                    tt[0].bind_batch(ax_l.encode(x), op, w, s, c)
+                    if per_stage:
+                        rr_, oo_ = rows(g)
+                        xl, ol, wl, sl, cl, fl, ml, _ = unpack(rr_, oo_, g)
+                    else:
+                        xl, ol, wl, sl, cl, fl, ml, oo_ = x, op, w, s, c, fz, mq, ops
+                    tt = make_terms(ax_l, bs_l, g, xl, ol, wl, sl, cl, fl, ml,
+                                    oo_, False)
+                    for t_ in tt:
+                        if hasattr(t_, "set_tau"):
+                            t_.set_tau(_tau_now[0])
                 zb = ctx.buffer(nl * 4); zb.zero()
                 db = ctx.buffer(nl * 4); db.zero()
                 for t_ in tt:
                     t_.accumulate_diag(zb, db)
-                dmax = float(db.download(np.float32, nl).max()) + 1e-30
+                dmax = float(_MaxReduce(ctx, nl)(db)) + 1e-30
                 if own:
                     tt = None                 # release the level's terms
                 return dict(ext=tuple(b.primal_extent for b in bs_l),
@@ -320,12 +425,15 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
             lv = [level_diag(g) for g in lv_grids[:-1]]
             lv.append(level_diag(grid, tt=terms))
             opt.set_preconditioner(
-                BpxPreconditioner(ctx, extents, n_channels, lv))
+                BpxPreconditioner(ctx, extents, n_channels, lv,
+                                  floor_rel=bpx_floor))
             if verbose:
                 print(f"  [bpx] {len(lv)} levels "
-                      f"{[tuple(L['grid']) for L in lv]}  "
-                      f"({time.time()-t0:.0f}s)", flush=True)
+                      f"{[tuple(L['grid']) for L in lv]}, floor_rel={bpx_floor:g}"
+                      f"  ({time.time()-t0:.0f}s)", flush=True)
 
+        _anyfuzz = bool((fz > 0).any())
+        _seed0 = 1 + seed + si * 10007
         loss_buf = ctx.buffer(4)
 
         def loss_fn():
@@ -334,8 +442,29 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
                 t.loss(opt.coef, loss_buf)
             return float(loss_buf.download(np.float32, 1)[0])
 
-        for _ in range(n_steps):
+        for _k in range(n_steps):
+            if resample_every and _k and per_stage and _k % resample_every == 0:
+                stage_rows, ops = rows(grid)
+                x, op, w, s, c, fz, mq, row_order = unpack(stage_rows, ops, grid)
+                terms = None            # release before allocating the next set
+                terms = build_terms()
+                opt.last_loss = None    # the objective moved; re-evaluate it
+            if tau_end is not None and n_steps > 1:
+                _tk = float(tau) + (float(tau_end) - float(tau)) * _k / (n_steps - 1)
+                if _tk != _tau_now[0]:
+                    _tau_now[0] = _tk
+                    for _t in terms:
+                        if hasattr(_t, "set_tau"):
+                            _t.set_tau(_tk)
+                    opt.last_loss = None
+            if _anyfuzz:
+                for _t in terms:
+                    if hasattr(_t, "set_seed"):
+                        _t.set_seed(_seed0 + _k)
+                opt.last_loss = None
             opt.step(terms, loss_fn, cg_iters=cg_iters)
+            if callback is not None:
+                callback(grid, _k + 1, opt)
         coef, prev = opt.get_coef(), grid
         losses.append(opt.last_loss)
         if verbose:

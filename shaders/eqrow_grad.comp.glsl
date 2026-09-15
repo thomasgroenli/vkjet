@@ -17,7 +17,7 @@
  *
  * Spec consts: 0 SPEC_STRIDE · 1 SPEC_TABLE_PERIOD.
  * Bindings: 0 Meta · 1 x · 2 primal · 3 coefs · 4 table · 5 dcoefs ·
- *   6 ddcoefs · 7 rowrec{op,w,s,pad} · 8 rowc(f4[N*8]) · 9 optab_i ·
+ *   6 ddcoefs · 7 rowrec{op,w,s,fuzz,m} · 8 rowc(f4[N*8]) · 9 optab_i ·
  *   10 optab_f · 11 grad(float, atomic).
  */
 #version 460
@@ -27,10 +27,11 @@
 #define ND 4
 #define NF 15
 #define NCPR 8
-/* NCH is declared by the ROW FILE: the operator table references channel
-   indices, so the objective is not well defined without it. A
-   specialization constant lets one SPIR-V module serve any channel count
-   while the driver still sizes fld[NF][NCH]/A[NCH] exactly. */
+/* NCH is declared by the ROW FILE, not by this shader: the operator table
+   references channel indices, so the objective is not well defined without
+   it. Specialization constant => one SPIR-V module serves any channel
+   count, and the driver sizes fld[NF][NCH]/A[NCH] exactly (no MAX padding,
+   so register pressure still tracks the real count). */
 layout(constant_id = 2) const int NCH = 5;
 layout(constant_id = 0) const int SPEC_STRIDE = 0x7fffffff;
 layout(constant_id = 1) const int SPEC_TABLE_PERIOD = 0;
@@ -38,9 +39,10 @@ layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Meta {
     int ndim; int n_samples; int n_channels; int num_combos;
-    float scale; int n_ops; int nnz_lin; int pad0;
+    float scale; int n_ops; int nnz_lin; int seed;
     int coef_period[16], order[16], degp1[16], stride[16], table_period[16],
         primal_extent[16], pstride[16], coef_offset[16], table_offset[16];
+    float tau;
 } meta;
 layout(set = 0, binding = 1, std430) readonly buffer XB { float x[]; };
 layout(set = 0, binding = 2, std430) readonly buffer PB { float primal[]; };
@@ -58,6 +60,35 @@ float hv(int p,int d,float xv){ float r=coefs[p+d]; for(int k=d-1;k>=0;k--) r=r*
 float hd(int p,int d,float xv){ float r=dcoefs[p+d]; for(int k=d-1;k>=0;k--) r=r*xv+dcoefs[p+k]; return r; }
 float hq(int p,int d,float xv){ float r=ddcoefs[p+d]; for(int k=d-1;k>=0;k--) r=r*xv+ddcoefs[p+k]; return r; }
 int pmod(int a,int b){ int r=a%b; return r<0?r+b:r; }
+
+/* Wrapped-Gaussian rows: a row with modulus m > 0 asserts r ≡ 0 (mod m)
+ * (aliased Doppler: m = 2·venc). Periodic form — r is wrapped to [-m/2, m/2]
+ * first, then the three branches k ∈ {-1,0,1} are marginalised at temperature
+ * sigma = tau·m (floored at 1e-3·m so tau = 0 is the hard sawtooth, no NaN).
+ * softwrap = d(wraploss)/dr: the pseudo-residual that replaces r in the
+ * gradient; the GN weight of the row is untouched (EM majorizer). m <= 0 →
+ * the plain least-squares row, bit-identical to the unwrapped kernel. */
+float softwrap(float r, float m, float tau) {
+    if (m <= 0.0) return r;
+    if (tau < 0.0) { float k = 6.28318530718/m; return sin(k*r)/k; }   /* pure cosine (PINN-style): first harmonic only */
+    r = r - m*round(r/m);
+    float sg = max(tau, 1e-3)*m; float inv = -0.5/(sg*sg);
+    float up = r+m, um = r-m;
+    float e0 = inv*r*r, ep = inv*up*up, em = inv*um*um;
+    float emax = max(e0, max(ep, em));
+    float w0 = exp(e0-emax), wp = exp(ep-emax), wm = exp(em-emax);
+    return (w0*r + wp*up + wm*um)/(w0+wp+wm);
+}
+float wraploss(float r, float m, float tau) {
+    if (m <= 0.0) return 0.5*r*r;
+    if (tau < 0.0) { float k = 6.28318530718/m; return (1.0-cos(k*r))/(k*k); }
+    r = r - m*round(r/m);
+    float sg = max(tau, 1e-3)*m; float s2 = sg*sg; float inv = -0.5/s2;
+    float up = r+m, um = r-m;
+    float e0 = inv*r*r, ep = inv*up*up, em = inv*um*um;
+    float emax = max(e0, max(ep, em));
+    return -s2*(emax + log(exp(e0-emax)+exp(ep-emax)+exp(em-emax)));
+}
 
 /* full second-order jet tap weights (jet2-v1 slot table) */
 void combo(int i, int ii[ND], float fr[ND], int pob[ND], out int prim, out float W[NF]) {
@@ -82,12 +113,44 @@ void combo(int i, int ii[ND], float fr[ND], int pob[ND], out int prim, out float
     W[13]=pv[0]*pd[1]*pv[2]*pd[3]; W[14]=pv[0]*pv[1]*pd[2]*pd[3];
 }
 
+/* ---- per-row Gaussian jitter of the evaluation point ---------------------
+ * rowrec slot 3 carries sigma in CELL units (the encoded x the kernels work
+ * in). The hourglassing this defeats happens at the cell scale, so cell units
+ * are the natural parameterisation and one row file stays meaningful at every
+ * rung of the ladder.
+ *
+ * eps is a pure function of (row, meta.seed). meta.seed is bumped ONCE PER
+ * OPTIMISER STEP, never per dispatch: a single step runs several line-search
+ * loss evaluations, a gradient, a diagonal and ~16 CG hvps, and they must all
+ * see the SAME perturbed points. Redrawing per dispatch would line-search a
+ * different function than the gradient came from, and CG cannot converge
+ * against a stochastic operator. With eps fixed the loss also stays exactly
+ * quartic in the coefficients, so the quartic line search remains exact.
+ */
+uint pcgh(uint v){ uint s=v*747796405u+2891336453u;
+                   uint w=((s>>((s>>28u)+4u))^s)*277803737u; return (w>>22u)^w; }
+float u01f(uint h){ return float(h>>8u)*(1.0/16777216.0); }
+void fuzz4(uint sn, float fz, out float g[ND]) {
+    uint b = pcgh(sn ^ (uint(meta.seed)*2654435769u));
+    [[unroll]] for (int k=0;k<ND;k+=2) {
+        float u1=max(u01f(pcgh(b+uint(2*k)+1u)),1e-7);
+        float u2=u01f(pcgh(b+uint(2*k)+2u));
+        float rr=fz*sqrt(-2.0*log(u1)), th=6.28318530718*u2;
+        g[k]=rr*cos(th); if (k+1<ND) g[k+1]=rr*sin(th);
+    }
+}
+
 void main() {
     uint sn = gl_GlobalInvocationID.x;
     if (int(sn) >= meta.n_samples) return;
     int ii[ND]; float fr[ND]; int pob[ND];
+    float fzs = intBitsToFloat(rowrec[sn*5u+3u]);
+    float jit[ND];
+    if (fzs > 0.0) fuzz4(sn, fzs, jit);
+    else [[unroll]] for (int d=0;d<ND;d++) jit[d]=0.0;
     [[unroll]] for (int d=0;d<ND;d++) {
-        float xv=x[sn*uint(ND)+uint(d)]; if (isnan(xv)) return;
+        float xv=x[sn*uint(ND)+uint(d)]+jit[d]; if (isnan(xv)) return;
+        xv=clamp(xv,0.0,float(meta.primal_extent[d])-1e-4);
         float ip=floor(xv); ii[d]=int(ip); fr[d]=xv-ip;
         pob[d]=meta.coef_offset[d]+pmod(ii[d],meta.coef_period[d])*meta.order[d]*meta.degp1[d];
     }
@@ -97,9 +160,10 @@ void main() {
     for (int i=0;i<meta.num_combos;i++){ combo(i,ii,fr,pob,prim,W);
         [[unroll]] for(int j=0;j<NF;j++) for(int ch=0;ch<NCH;ch++) fld[j][ch]+=W[j]*primal[prim+ch]; }
 
-    int op = rowrec[sn*4u];
-    float rw = intBitsToFloat(rowrec[sn*4u+1u]);
-    float rs = intBitsToFloat(rowrec[sn*4u+2u]);
+    int op = rowrec[sn*5u];
+    float rw = intBitsToFloat(rowrec[sn*5u+1u]);
+    float rs = intBitsToFloat(rowrec[sn*5u+2u]);
+    float rm = intBitsToFloat(rowrec[sn*5u+4u]);
     int nops1 = meta.n_ops + 1;
     int l0 = optab_i[op], l1 = optab_i[op+1];
     int q0 = optab_i[nops1+op], q1 = optab_i[nops1+op+1];
@@ -109,7 +173,7 @@ void main() {
     for (int e=l0; e<l1; e++) {
         int pk = optab_i[lbase+e]; float v = optab_f[e];
         int cixp1 = pk & 15; if (cixp1>0) v *= rowc[sn*uint(NCPR)+uint(cixp1-1)];
-        int slk = (pk>>8);   /* slot NF = order-0 term */
+        int slk = (pk>>8);          /* slot NF = order-0 (constant) term */
         r += (slk < NF) ? v * fld[slk][(pk>>4)&15] : v;
     }
     for (int e=q0; e<q1; e++) {
@@ -117,7 +181,7 @@ void main() {
         int cixp1 = pk & 255; if (cixp1>0) v *= rowc[sn*uint(NCPR)+uint(cixp1-1)];
         r += v * fld[(pk>>20)&15][(pk>>16)&15] * fld[(pk>>12)&15][(pk>>8)&15];
     }
-    float a = meta.scale * rw * r;
+    float a = meta.scale * rw * softwrap(r, rm, meta.tau);
 
     /* scatter: per combo build the Jacobian row A[ch] from the entry lists */
     for (int i=0;i<meta.num_combos;i++){ combo(i,ii,fr,pob,prim,W);
@@ -126,7 +190,7 @@ void main() {
         for (int e=l0; e<l1; e++) {
             int pk = optab_i[lbase+e]; float v = optab_f[e];
             int cixp1 = pk & 15; if (cixp1>0) v *= rowc[sn*uint(NCPR)+uint(cixp1-1)];
-            int slk = (pk>>8);   /* order-0 has no Jacobian */
+            int slk = (pk>>8);      /* order-0 terms have no Jacobian */
             if (slk < NF) A[(pk>>4)&15] += v * W[slk];
         }
         for (int e=q0; e<q1; e++) {

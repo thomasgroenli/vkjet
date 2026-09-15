@@ -40,7 +40,7 @@ from .context import STORAGE
 from .eqrow import (EqRowTerm, OperatorTable, NF, NCH, NCPR, MIXED_PAIRS,
                     pack_eqrow_meta)
 
-GEN_VERSION = "2"
+GEN_VERSION = "4"      # 3: row record {op,w,s,fuzz,m} + wrapped rows; 4: tau<0 = cosine
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "vkjet", "genspv")
 SPIRV_MAGIC = b"\x03\x02\x23\x07"     # 0x07230203, little-endian on disk
 
@@ -88,18 +88,36 @@ def source_key(srcs):
 
 
 def valid_spv(path):
-    """True if `path` is a plausible SPIR-V module (present, word-sized,
-    correct magic). Guards against a partial file left by an interrupted or
-    concurrent compile — os.path.exists alone accepts those forever."""
+    """True only for a STRUCTURALLY COMPLETE SPIR-V module.
+
+    Size, 4-alignment and magic are not enough: a compile killed part-way
+    leaves a file that passes all three whenever its length happens to land
+    4-aligned, and the loader then trusts a truncated module. So walk the
+    instruction stream — each instruction's word count is the high 16 bits of
+    its first word — and require it to end EXACTLY at end-of-file.
+    """
     try:
-        sz = os.path.getsize(path)
-        if sz < 20 or sz % 4:
-            return False
         with open(path, "rb") as f:
-            magic = f.read(4)
-        return magic in (SPIRV_MAGIC, SPIRV_MAGIC[::-1])
+            raw = f.read()
     except OSError:
         return False
+    if len(raw) < 20 or len(raw) % 4:
+        return False
+    magic = raw[:4]
+    if magic not in (SPIRV_MAGIC, SPIRV_MAGIC[::-1]):
+        return False
+    words = np.frombuffer(raw, dtype="<u4" if magic == SPIRV_MAGIC else ">u4")
+    i, n, last = 5, len(words), -1          # 5-word header, then instructions
+    while i < n:
+        wc = int(words[i] >> 16)
+        if wc == 0 or i + wc > n:           # zero-length or overruns the file
+            return False
+        last = i
+        i += wc
+    # Landing on n is necessary but NOT sufficient: a cut at a random point
+    # lands on an instruction boundary roughly a quarter of the time. A
+    # complete module always ends with OpFunctionEnd (opcode 56).
+    return i == n and last >= 0 and (int(words[last]) & 0xFFFF) == 56
 
 
 def structure_hash(ops: OperatorTable, k: int) -> str:
@@ -128,9 +146,10 @@ layout(constant_id = 1) const int SPEC_TABLE_PERIOD = 0;
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0, std430) readonly buffer Meta {{
     int ndim; int n_samples; int n_channels; int num_combos;
-    float scale; int n_ops; int nnz_lin; int pad0;
+    float scale; int n_ops; int nnz_lin; int seed;
     int coef_period[16], order[16], degp1[16], stride[16], table_period[16],
         primal_extent[16], pstride[16], coef_offset[16], table_offset[16];
+    float tau;
 }} meta;
 layout(set = 0, binding = 1, std430) readonly buffer XB {{ float x[]; }};
 layout(set = 0, binding = 2, std430) readonly buffer PB {{ float primal[]; }};
@@ -148,6 +167,37 @@ float hd(int p,int d,float xv){{ float r=dcoefs[p+d]; for(int k=d-1;k>=0;k--) r=
 float hq(int p,int d,float xv){{ float r=ddcoefs[p+d]; for(int k=d-1;k>=0;k--) r=r*xv+ddcoefs[p+k]; return r; }}
 int pmod(int a,int b){{ int r=a%b; return r<0?r+b:r; }}
 
+/* Wrapped-Gaussian rows (contract (x, op, payload, m)): a row with modulus
+ * m > 0 asserts r ≡ 0 (mod m). Periodic form — wrap r to [-m/2, m/2], then
+ * marginalise the branches k ∈ {{-1,0,1}} at temperature sigma = tau·m
+ * (floored at 1e-3·m: tau = 0 is the hard sawtooth, never NaN). softwrap is
+ * d(wraploss)/dr, the pseudo-residual that replaces r in the gradient; the GN
+ * weight stays the row's own (EM majorizer). m <= 0 → plain LS row.
+ * tau < 0 selects the PURE COSINE loss (m/2π)²·(1−cos(2πr/m)) instead — the
+ * first-harmonic (large-sigma) member of the same family, i.e. the PINN
+ * reference's in-loss unwrap — for A/B on identical rows. */
+float softwrap(float r, float m, float tau) {{
+    if (m <= 0.0) return r;
+    if (tau < 0.0) {{ float k = 6.28318530718/m; return sin(k*r)/k; }}   /* pure cosine (PINN-style): first harmonic only */
+    r = r - m*round(r/m);
+    float sg = max(tau, 1e-3)*m; float inv = -0.5/(sg*sg);
+    float up = r+m, um = r-m;
+    float e0 = inv*r*r, ep = inv*up*up, em = inv*um*um;
+    float emax = max(e0, max(ep, em));
+    float w0 = exp(e0-emax), wp = exp(ep-emax), wm = exp(em-emax);
+    return (w0*r + wp*up + wm*um)/(w0+wp+wm);
+}}
+float wraploss(float r, float m, float tau) {{
+    if (m <= 0.0) return 0.5*r*r;
+    if (tau < 0.0) {{ float k = 6.28318530718/m; return (1.0-cos(k*r))/(k*k); }}
+    r = r - m*round(r/m);
+    float sg = max(tau, 1e-3)*m; float s2 = sg*sg; float inv = -0.5/s2;
+    float up = r+m, um = r-m;
+    float e0 = inv*r*r, ep = inv*up*up, em = inv*um*um;
+    float emax = max(e0, max(ep, em));
+    return -s2*(emax + log(exp(e0-emax)+exp(ep-emax)+exp(em-emax)));
+}}
+
 void combo(int i, int ii[ND], float fr[ND], int pob[ND], out int prim,
 {w_out_decl}) {{
     int reduce=i; prim=0; float pv[ND];{pd_decl}{pq_decl}
@@ -161,11 +211,50 @@ void combo(int i, int ii[ND], float fr[ND], int pob[ND], out int prim,
     }}
 {w_exprs}
 }}
+
+/* per-row Gaussian jitter — contract documented in shaders/eqrow_grad.comp.glsl.
+ * eps is a pure function of (row, meta.seed), and meta.seed advances ONCE PER
+ * OPTIMISER STEP, so every dispatch inside a step sees the same points. */
+uint pcgh(uint v){{ uint s=v*747796405u+2891336453u;
+                    uint w=((s>>((s>>28u)+4u))^s)*277803737u; return (w>>22u)^w; }}
+float u01f(uint h){{ return float(h>>8u)*(1.0/16777216.0); }}
+void fuzz4(uint sn, float fz, out float g[ND]) {{
+    uint b = pcgh(sn ^ (uint(meta.seed)*2654435769u));
+    [[unroll]] for (int k=0;k<ND;k+=2) {{
+        float u1=max(u01f(pcgh(b+uint(2*k)+1u)),1e-7);
+        float u2=u01f(pcgh(b+uint(2*k)+2u));
+        float rr=fz*sqrt(-2.0*log(u1)), th=6.28318530718*u2;
+        g[k]=rr*cos(th); if (k+1<ND) g[k+1]=rr*sin(th);
+    }}
+}}
 """
 
+# Per-operator prelude: reads this row's sigma from rowrec slot 3 and jitters.
 _PRELUDE = """    int ii[ND]; float fr[ND]; int pob[ND];
+    float fzs = intBitsToFloat(rowrec[sn*5u+3u]);
+    float jit[ND];
+    if (fzs > 0.0) fuzz4(sn, fzs, jit);
+    else [[unroll]] for (int d=0;d<ND;d++) jit[d]=0.0;
     [[unroll]] for (int d=0;d<ND;d++) {{
-        float xv=x[sn*uint(ND)+uint(d)]; if (isnan(xv)) {nanact}
+        float xv=x[sn*uint(ND)+uint(d)]+jit[d]; if (isnan(xv)) {nanact}
+        xv=clamp(xv,0.0,float(meta.primal_extent[d])-1e-4);
+        float ip=floor(xv); ii[d]=int(ip); fr[d]=xv-ip;
+        pob[d]=meta.coef_offset[d]+pmod(ii[d],meta.coef_period[d])*meta.order[d]*meta.degp1[d];
+    }}
+"""
+
+# Grouped prelude: shared-gather shaders bind no rowrec (weights/targets arrive
+# as (n,m) planes), so there is no per-row sigma to read and this stays
+# unfuzzed; _dispatch_terms keeps fuzzed operators off that path. Retaining
+# shared gather under fuzz needs a PER-POINT offset, not a per-row one.
+_PRELUDE_GROUP = """    int ii[ND]; float fr[ND]; int pob[ND];
+    float fzs = wrow[sn*{sigslot}];
+    float jit[ND];
+    if (fzs > 0.0) fuzz4(sn, fzs, jit);
+    else [[unroll]] for (int d=0;d<ND;d++) jit[d]=0.0;
+    [[unroll]] for (int d=0;d<ND;d++) {{
+        float xv=x[sn*uint(ND)+uint(d)]+jit[d]; if (isnan(xv)) {nanact}
+        xv=clamp(xv,0.0,float(meta.primal_extent[d])-1e-4);
         float ip=floor(xv); ii[d]=int(ip); fr[d]=xv-ip;
         pob[d]=meta.coef_offset[d]+pmod(ii[d],meta.coef_period[d])*meta.order[d]*meta.degp1[d];
     }}
@@ -198,14 +287,14 @@ def emit_shaders(ops: OperatorTable, k: int):
             f"operator {ops.names[k]!r} has no entries — nothing to specialize "
             f"(residual is just -s; use the generic EqRowTerm)")
     # ORDER-0 (SLOT_CONST) entries carry no field factor: they shift the
-    # residual and vanish from the Jacobian, so they take no gathered site
-    # (there is no jet slot 15 to gather) and no cotangent row.
+    # residual and vanish from the Jacobian, so they must be excluded from the
+    # gathered sites (there is no jet slot 15 to gather) and from the cotangent.
     lin_f = [(e, t) for e, t in enumerate(lin) if t[0] != NF]
     lin_c = [(e, t) for e, t in enumerate(lin) if t[0] == NF]
     if not lin_f and not quad:
         raise ValueError(
             f"operator {ops.names[k]!r} has only order-0 terms — its residual "
-            f"does not depend on the field, so its Jacobian is identically zero")
+            f"does not depend on the field, so the Jacobian is identically zero")
     used_slots = sorted({t[0] for _, t in lin_f}
                         | {q[0] for q in quad} | {q[2] for q in quad})
     sites = sorted({(t[0], t[1]) for _, t in lin_f}
@@ -248,14 +337,14 @@ def emit_shaders(ops: OperatorTable, k: int):
 
     # residual
     rterms = [f"v{e}*f{t[0]}_{t[1]}" for e, t in lin_f]
-    rterms += [f"v{e}" for e, _ in lin_c]      # order-0: no field factor
+    rterms += [f"v{e}" for e, _ in lin_c]          # order-0: no field factor
     rterms += [f"v{len(lin)+j}*f{s1}_{c1}*f{s2}_{c2}"
                for j, (s1, c1, s2, c2, _, _) in enumerate(quad)]
     rexpr = " + ".join(rterms) if rterms else "0.0"
 
     # per-combo Jacobian row A_c for used channels
     aterms = {c: [] for c in chans}
-    for e, t in lin_f:                          # lin_c has no Jacobian row
+    for e, t in lin_f:                             # lin_c has no Jacobian row
         aterms[t[1]].append(f"v{e}*W{t[0]}")
     for j, (s1, c1, s2, c2, _, _) in enumerate(quad):
         e = len(lin) + j
@@ -269,8 +358,9 @@ def emit_shaders(ops: OperatorTable, k: int):
                 f"        combo(i,ii,fr,pob,prim,{wargs});\n"
                 f"{ablock}\n{body}\n    }}")
 
-    rw = ("    float rw = intBitsToFloat(rowrec[sn*4u+1u]);\n"
-          "    float rs = intBitsToFloat(rowrec[sn*4u+2u]);")
+    rw = ("    float rw = intBitsToFloat(rowrec[sn*5u+1u]);\n"
+          "    float rs = intBitsToFloat(rowrec[sn*5u+2u]);\n"
+          "    float rm = intBitsToFloat(rowrec[sn*5u+4u]);")
 
     grad_main = f"""void main() {{
     uint sn = gl_GlobalInvocationID.x;
@@ -279,7 +369,7 @@ def emit_shaders(ops: OperatorTable, k: int):
 {vblock}
 {gather}
     float r = -rs + {rexpr};
-    float a = meta.scale * rw * r;
+    float a = meta.scale * rw * softwrap(r, rm, meta.tau);
 {scatter(chr(10).join(f"        atomicAdd(grad[prim+{c}], a*A{c});" for c in chans))}
 }}
 """
@@ -287,8 +377,13 @@ def emit_shaders(ops: OperatorTable, k: int):
     uint sn = gl_GlobalInvocationID.x;
     float my = 0.0; bool ok = (int(sn) < meta.n_samples);
     int ii[ND]; float fr[ND]; int pob[ND];
+    float jit[ND];
+    [[unroll]] for (int d=0;d<ND;d++) jit[d]=0.0;
+    if (ok) {{ float fzs = intBitsToFloat(rowrec[sn*5u+3u]);
+               if (fzs > 0.0) fuzz4(sn, fzs, jit); }}
     if (ok) [[unroll]] for (int d=0;d<ND;d++) {{
-        float xv=x[sn*uint(ND)+uint(d)]; if (isnan(xv)){{ok=false;break;}}
+        float xv=x[sn*uint(ND)+uint(d)]+jit[d]; if (isnan(xv)){{ok=false;break;}}
+        xv=clamp(xv,0.0,float(meta.primal_extent[d])-1e-4);
         float ip=floor(xv); ii[d]=int(ip); fr[d]=xv-ip;
         pob[d]=meta.coef_offset[d]+pmod(ii[d],meta.coef_period[d])*meta.order[d]*meta.degp1[d];
     }}
@@ -297,7 +392,7 @@ def emit_shaders(ops: OperatorTable, k: int):
 {vblock}
 {gather}
         float r = -rs + {rexpr};
-        my = 0.5 * meta.scale * rw * r * r;
+        my = meta.scale * rw * wraploss(r, rm, meta.tau);
     }}
     float warp = subgroupAdd(my);
     if (subgroupElect()) atomicAdd(loss[0], warp);
@@ -426,8 +521,8 @@ class GeneratedRowTerm(EqRowTerm):
         self.structure = structure_hash(ops, k)
         self.cache_key = key
 
-    def _shared(self, coef_buf):
-        b = self._batch
+    def _shared(self, coef_buf, b=None):
+        b = self._batch if b is None else b
         return [b["mb"], b["xb"], coef_buf, self.coefs_buf, self.table_buf,
                 self.dcoefs_buf, self.ddcoefs_buf, b["rrb"], b["rcb"],
                 self.vals_buf]
@@ -520,16 +615,25 @@ def verify_generated(ctx, term, bases, inv_widths, ops, k, seed=0, n=64,
     s = rng.standard_normal(n).astype(np.float32) * 0.1
     c = rng.standard_normal((n, NCPR)).astype(np.float32)
 
+    # half the rows wrapped (m > 0, small enough that |r| spans several
+    # wraps at coef ~0.3), half exact — the m = 0 identity and the wrapped
+    # path are both parity-checked against the referee, at a finite tau
+    mod = np.where(rng.random(n) < 0.5, rng.uniform(0.05, 0.4, n), 0.0)
+    mod = mod.astype(np.float32)
     sub = OperatorTable()
     sub.add_op(ops.names[k], ops.lin[k], ops.quad[k])
     ref = EqRowTerm(ctx, bases, inv_widths, sub)
-    ref.bind_batch(x_enc, np.zeros(n, np.int32), w, s, c)
-    saved = term._batch
-    term.bind_batch(x_enc, np.zeros(n, np.int32), w, s, c)
+    ref.tau = 0.3
+    ref.bind_batch(x_enc, np.zeros(n, np.int32), w, s, c, modulus=mod)
+    saved, saved_mb = term._batch, list(term.minibatches)
+    saved_tau = getattr(term, "tau", 0.0)
+    term.tau = 0.3
+    term.bind_batch(x_enc, np.zeros(n, np.int32), w, s, c, modulus=mod)
     try:
         _compare(ref, term, ctx, nco, rtol, "generated-kernel")
     finally:
-        term._batch = saved
+        term._batch, term.minibatches = saved, saved_mb
+        term.tau = saved_tau
     _VERIFIED.add(memo)
     return True
 
@@ -553,9 +657,10 @@ layout(constant_id = 1) const int SPEC_TABLE_PERIOD = 0;
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0, std430) readonly buffer Meta {{
     int ndim; int n_samples; int n_channels; int num_combos;
-    float scale; int n_ops; int nnz_lin; int pad0;
+    float scale; int n_ops; int nnz_lin; int seed;
     int coef_period[16], order[16], degp1[16], stride[16], table_period[16],
         primal_extent[16], pstride[16], coef_offset[16], table_offset[16];
+    float tau;
 }} meta;
 layout(set = 0, binding = 1, std430) readonly buffer XB {{ float x[]; }};
 layout(set = 0, binding = 2, std430) readonly buffer PB {{ float primal[]; }};
@@ -572,6 +677,23 @@ float hv(int p,int d,float xv){{ float r=coefs[p+d]; for(int k=d-1;k>=0;k--) r=r
 float hd(int p,int d,float xv){{ float r=dcoefs[p+d]; for(int k=d-1;k>=0;k--) r=r*xv+dcoefs[p+k]; return r; }}
 float hq(int p,int d,float xv){{ float r=ddcoefs[p+d]; for(int k=d-1;k>=0;k--) r=r*xv+ddcoefs[p+k]; return r; }}
 int pmod(int a,int b){{ int r=a%b; return r<0?r+b:r; }}
+
+/* per-point Gaussian jitter for the shared-gather path. sigma rides a trailing
+ * column of the W plane, so every operator at a point receives the SAME offset
+ * and the gather stays shared. eps is a pure function of (point, meta.seed),
+ * which advances once per optimiser step. */
+uint pcgh(uint v){{ uint s=v*747796405u+2891336453u;
+                    uint w=((s>>((s>>28u)+4u))^s)*277803737u; return (w>>22u)^w; }}
+float u01f(uint h){{ return float(h>>8u)*(1.0/16777216.0); }}
+void fuzz4(uint sn, float fz, out float g[ND]) {{
+    uint b = pcgh(sn ^ (uint(meta.seed)*2654435769u));
+    [[unroll]] for (int k=0;k<ND;k+=2) {{
+        float u1=max(u01f(pcgh(b+uint(2*k)+1u)),1e-7);
+        float u2=u01f(pcgh(b+uint(2*k)+2u));
+        float rr=fz*sqrt(-2.0*log(u1)), th=6.28318530718*u2;
+        g[k]=rr*cos(th); if (k+1<ND) g[k+1]=rr*sin(th);
+    }}
+}}
 
 void combo(int i, int ii[ND], float fr[ND], int pob[ND], out int prim,
 {w_out_decl}) {{
@@ -599,6 +721,9 @@ def emit_group_shaders(ops: OperatorTable, ids):
         raise ValueError("grouped generation needs at least one operator")
     for k in ids:                        # raise, not assert: under python -O
         for e in ops.lin[k]:             # a stripped assert would emit a
+            if e[0] == NF:               # kernel that silently drops a term
+                raise ValueError(f"grouped ops cannot carry an order-0 "
+                                 f"(SLOT_CONST) term: {ops.names[k]!r}")
             if e[3] >= 0:                # kernel that silently drops c[cix]
                 raise ValueError(f"grouped ops must be payload-free: "
                                  f"{ops.names[k]!r} lin entry references "
@@ -640,7 +765,12 @@ def emit_group_shaders(ops: OperatorTable, ids):
     vblock = "\n".join(f"    float v{i} = vals[{i}];"
                        for i in range(len(values)))
 
-    ws = "\n".join(f"    float w{j} = wrow[sn*{m}u+{j}u];\n"
+    # W is (n, m+1): m operator weights plus a trailing PER-POINT sigma.
+    # A per-ROW sigma would move co-located rows to different points and
+    # destroy the shared gather; a per-POINT one cannot, which is what lets
+    # fuzzed physics keep this kernel. Costs one float per point, no new
+    # binding, no meta-layout change.
+    ws = "\n".join(f"    float w{j} = wrow[sn*{m + 1}u+{j}u];\n"
                    f"    float s{j} = srow[sn*{m}u+{j}u];" for j in range(m))
     fdecl = "\n".join(f"    float f{s}_{c} = 0.0;" for s, c in sites)
     wdecl = "    float " + ", ".join(f"W{s}" for s in used_slots) + ";"
@@ -711,7 +841,7 @@ def emit_group_shaders(ops: OperatorTable, ids):
             f"A{j}_{c}*y{j}" for j in range(m) if c in ach[j]) + ");"
         for c in chans)
 
-    pre = _PRELUDE.format(nanact="return;")
+    pre = _PRELUDE_GROUP.format(nanact="return;", sigslot=f"{m + 1}u+{m}u")
     grad_main = f"""void main() {{
     uint sn = gl_GlobalInvocationID.x;
     if (int(sn) >= meta.n_samples) return;
@@ -730,8 +860,13 @@ def emit_group_shaders(ops: OperatorTable, ids):
     uint sn = gl_GlobalInvocationID.x;
     float my = 0.0; bool ok = (int(sn) < meta.n_samples);
     int ii[ND]; float fr[ND]; int pob[ND];
+    float jit[ND];
+    [[unroll]] for (int d=0;d<ND;d++) jit[d]=0.0;
+    if (ok) {{ float fzs = wrow[sn*{m + 1}u+{m}u];
+               if (fzs > 0.0) fuzz4(sn, fzs, jit); }}
     if (ok) [[unroll]] for (int d=0;d<ND;d++) {{
-        float xv=x[sn*uint(ND)+uint(d)]; if (isnan(xv)){{ok=false;break;}}
+        float xv=x[sn*uint(ND)+uint(d)]+jit[d]; if (isnan(xv)){{ok=false;break;}}
+        xv=clamp(xv,0.0,float(meta.primal_extent[d])-1e-4);
         float ip=floor(xv); ii[d]=int(ip); fr[d]=xv-ip;
         pob[d]=meta.coef_offset[d]+pmod(ii[d],meta.coef_period[d])*meta.order[d]*meta.degp1[d];
     }}
@@ -829,22 +964,58 @@ class GroupedRowTerm(EqRowTerm):
             "GroupedRowTerm binds with bind_points(x_enc, W(n,m), S(n,m)); "
             "the inherited bind_batch would install a _batch without wb/sb")
 
-    def bind_points(self, x_enc, W, S, scale=1.0):
+    def bind_points(self, x_enc, W, S, scale=1.0, sigma=None):
+        """`sigma`: per-POINT jitter width in cells (None = 0). It rides as a
+        trailing column of the W plane, so every operator at a point receives
+        the SAME offset and the shared gather survives."""
         ctx = self.ctx
         x_enc = np.ascontiguousarray(x_enc, np.float32)
         n = x_enc.shape[0]
         W = np.ascontiguousarray(W, np.float32).reshape(n, self.m)
         S = np.ascontiguousarray(S, np.float32).reshape(n, self.m)
-        meta_b = pack_eqrow_meta(self.bases, n, scale, self.m, 0)
+        sg = (np.zeros((n, 1), np.float32) if sigma is None else
+              np.ascontiguousarray(sigma, np.float32).reshape(n, 1))
+        W = np.concatenate([W, sg], 1)
+        meta_b = pack_eqrow_meta(self.bases, n, scale, self.m, 0, 0)
         xb = ctx.buffer(x_enc.nbytes); xb.upload(x_enc.reshape(-1))
         mb = ctx.buffer(len(meta_b), device_local=False); mb.upload(meta_b)
         wb = ctx.buffer(W.nbytes); wb.upload(W.reshape(-1))
         sb = ctx.buffer(S.nbytes); sb.upload(S.reshape(-1))
-        self._batch = dict(n=n, xb=xb, mb=mb, wb=wb, sb=sb, scale=scale)
+        self._batch = dict(n=n, xb=xb, mb=mb, wb=wb, sb=sb, scale=scale,
+                           seed=0)
+        self.minibatches = [self._batch]
         return self
 
-    def _shared(self, coef_buf):
-        b = self._batch
+    def bind_point_buckets(self, x_enc, W, S, buckets, scale=1.0, sigma=None):
+        """Bucketed bind_points. Buckets index POINTS, not rows: this kernel's
+        work unit is one point carrying all m operators through a shared gather,
+        so a bucket takes a point whole. Every row at a chosen point is in the
+        minibatch, which leaves each row's inclusion probability 1/K (the
+        estimator stays unbiased) while correlating the m rows at a point."""
+        self.bind_points(x_enc, W, S, scale=scale, sigma=sigma)
+        if len(buckets) == 1:
+            assert len(buckets[0]) == self._batch["n"], "K=1 must be the whole set"
+            return self
+        x_enc = np.asarray(x_enc); W = np.asarray(W); S = np.asarray(S)
+        keep, mbs = self._batch, []      # bind_points overwrites BOTH _batch
+        for ix in buckets:                   # and minibatches — collect locally
+            self.bind_points(x_enc[ix], W[ix], S[ix], scale=scale,
+                             sigma=(None if sigma is None
+                                    else np.asarray(sigma)[ix]))
+            mbs.append(self._batch)
+        self._batch, self.minibatches = keep, mbs
+        return self
+
+    def set_seed(self, seed):
+        for b in self._all_batches():
+            if b.get("seed") == int(seed):
+                continue
+            b["seed"] = int(seed)
+            b["mb"].upload(pack_eqrow_meta(self.bases, b["n"], b["scale"],
+                                           self.m, 0, seed))
+
+    def _shared(self, coef_buf, b=None):
+        b = self._batch if b is None else b
         return [b["mb"], b["xb"], coef_buf, self.coefs_buf, self.table_buf,
                 self.dcoefs_buf, self.ddcoefs_buf, b["wb"], b["sb"],
                 self.vals_buf]
@@ -873,11 +1044,11 @@ def verify_grouped(ctx, term, bases, inv_widths, ops, ids, seed=0, n=48,
     ref.bind_batch(np.repeat(xp, m, axis=0),
                    np.tile(np.arange(m, dtype=np.int32), n),
                    W.reshape(-1), S.reshape(-1), None)
-    saved = term._batch
+    saved, saved_mb = term._batch, list(term.minibatches)
     term.bind_points(xp, W, S)
     try:
         _compare(ref, term, ctx, nco, rtol, "grouped")
     finally:
-        term._batch = saved
+        term._batch, term.minibatches = saved, saved_mb
     _VERIFIED.add(memo)
     return True

@@ -243,8 +243,8 @@ def test_verify_catches_sabotage(ctx, cache):
 
     cases = [("diag", "float sw = meta.scale * rw;", "float sw = 2.0 * meta.scale * rw;"),
              ("hvp", "float y = meta.scale * rw * Jv;", "float y = 2.0 * meta.scale * rw * Jv;"),
-             ("grad", "float a = meta.scale * rw * r;",
-              "float a = meta.scale * rw * r; if (ii[3] >= meta.primal_extent[3]-1) return;")]
+             ("grad", "float a = meta.scale * rw * softwrap(r, rm, meta.tau);",
+              "float a = meta.scale * rw * softwrap(r, rm, meta.tau); if (ii[3] >= meta.primal_extent[3]-1) return;")]
     for kind, find, repl in cases:
         d = tempfile.mkdtemp()
         gk.emit_shaders = sabotage(kind, find, repl)
