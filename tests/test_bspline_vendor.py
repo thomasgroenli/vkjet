@@ -6,7 +6,7 @@ whenever upstream genspline happens to be importable, every basis vkjet can
 build must come out bit-identical. It SKIPS (not fails) when genspline is
 absent, which is the normal state on a production machine.
 
-Run: PYTHONPATH=~/projects/volkano python3 tests/test_bspline_vendor.py
+Run: python3 tests/test_bspline_vendor.py
 """
 import os
 import sys

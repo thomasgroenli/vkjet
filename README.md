@@ -108,8 +108,8 @@ See `PERFORMANCE.md` for recorded performance items.
 
 **volkano + numpy.** That is the whole list.
 
-- [volkano](https://github.com/thomgronli/volkano) — the Vulkan binding. Not on PyPI;
-  clone it and put it on `PYTHONPATH`.
+- [volkano](https://pypi.org/project/volkano/) — the Vulkan binding, installed from PyPI
+  as a regular dependency.
 - The B-spline basis generator is **vendored** in `vkjet/_gs` (from `genspline`), so
   there is no external spline dependency. `tests/test_bspline_vendor.py` cross-checks
   the vendored copy against upstream bit-for-bit whenever upstream is importable.
@@ -119,18 +119,18 @@ JIT tier. Without one everything still runs, on the generic kernel, at roughly 5
 cost. Discovery honours `$GLSLC` and `$GLSLANG`, then `PATH`.
 
 ```bash
-git clone <volkano> ~/projects/volkano
-PYTHONPATH=~/projects/volkano python3 -c "import vkjet; print(vkjet.__version__)"
+pip install -e .
+python3 -c "import vkjet; print(vkjet.__version__)"
 ```
 
 ## Tests
 
 ```bash
-PYTHONPATH=~/projects/volkano python3 tests/test_bspline_vendor.py   # vendor == upstream
-PYTHONPATH=~/projects/volkano python3 tests/test_fit_rows.py         # end-to-end, JIT == generic
-PYTHONPATH=~/projects/volkano python3 tests/test_genkernel.py        # JIT parity + cache integrity
-PYTHONPATH=~/projects/volkano python3 tests/test_wrapped_rows.py     # congruence rows: oracle, FD, JIT parity
-PYTHONPATH=~/projects/volkano python3 tests/test_fuzz.py             # jittered rows: parity, determinism, sigma->0
+python3 tests/test_bspline_vendor.py   # vendor == upstream
+python3 tests/test_fit_rows.py         # end-to-end, JIT == generic
+python3 tests/test_genkernel.py        # JIT parity + cache integrity
+python3 tests/test_wrapped_rows.py     # congruence rows: oracle, FD, JIT parity
+python3 tests/test_fuzz.py             # jittered rows: parity, determinism, sigma->0
 ```
 
 `shaders/build.sh` rebuilds the static SPIR-V (`eqrow_*`, `kernel_apply`, the CG/vector

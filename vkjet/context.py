@@ -150,7 +150,7 @@ class Context:
         check(vk.vkCreateInstance(ci.ref, None, self.instance.ref), "vkCreateInstance")
 
     def _pick_physical_device(self, prefer_discrete, device_index):
-        n = vk.uint32_t(0)
+        n = uint32(0)
         vk.vkEnumeratePhysicalDevices(self.instance, n.ref, None)
         devs = (vk.VkPhysicalDevice * int(n.value))()
         vk.vkEnumeratePhysicalDevices(self.instance, n.ref, arrptr(devs, vk.VkPhysicalDevice))
@@ -174,7 +174,7 @@ class Context:
         vk.vkGetPhysicalDeviceMemoryProperties(self.physical_device, self.memprops.ref)
 
     def _create_device_and_queue(self):
-        qn = vk.uint32_t(0)
+        qn = uint32(0)
         vk.vkGetPhysicalDeviceQueueFamilyProperties(self.physical_device, qn.ref, None)
         qf = (vk.VkQueueFamilyProperties * int(qn.value))()
         vk.vkGetPhysicalDeviceQueueFamilyProperties(

@@ -7,7 +7,7 @@ Three gates:
      continuity constraint is recovered
   3. the forward evaluator round-trips the fitted coefficients
 
-Run: PYTHONPATH=~/projects/volkano python3 tests/test_fit_rows.py
+Run: python3 tests/test_fit_rows.py
 """
 import os
 import sys
