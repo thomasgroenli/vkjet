@@ -20,11 +20,20 @@ u   = res.forward(x_query)          # (N, 5)
 
 ## The model
 
-Every row is `(x, op_id, w, s, c[8])`. The operator table defines, at the row's point,
+Every row is `(x, op_id, w, s, c[8], m, fuzz)`. The operator table defines, at the row's point,
 
 ```
-r = ⟨L, J(f)(x)⟩ + JᵀQJ − s          loss += ½ · scale · w · r²
+r = ⟨L, J(f)(x)⟩ + JᵀQJ − s          loss += ½ · scale · w · ρ_m(r)
 ```
+
+with `ρ_m(r) = r²` for `m = 0` and, for `m > 0`, the wrapped Gaussian: the row asserts the
+**congruence** `r ≡ 0 (mod m)` (an aliased Doppler reading with `m = 2·venc`), its loss is
+periodic in `r` with the branches `k ∈ {−1, 0, +1}` marginalised at temperature `σ = τ·m`
+(`fit_rows(tau=...)`; `τ = 0` the hard sawtooth, `τ < 0` the pure cosine). Under Gauss-Newton
+that is soft EM against a soft-unwrapped target, so **no unwrapping precedes the solve** —
+unwrapping is rows too (pair rows on the Itoh condition, authored by the caller). A row with
+`fuzz = σ > 0` (cell units) is evaluated at `x + N(0, σ²)`, redrawn once per step: it declares a
+measure about `x`, not a point (a fixed collocation set gets overfitted).
 
 `J(f)(x)` is the second-order jet: **15 slots** (`val`, `∂t ∂x ∂y ∂z`, `∂tt ∂xx ∂yy ∂zz`,
 `∂t∂x … ∂y∂z`) × **5 channels**. `L` is a sparse covector on that jet, `Q` a sparse
@@ -77,9 +86,23 @@ today, and any edit to the generator invalidates it automatically.
 ## Optimiser
 
 Matrix-free Gauss-Newton CG with Levenberg-Marquardt damping. `H_GN·v` comes from the
-terms themselves, so the normal equations are never formed; the Jacobi preconditioner is
-the GN diagonal. Truncating CG at a fixed `cg_iters` is deliberate Krylov
-regularisation. Coarse-to-fine dyadic ladder with a Greville-aligned warm start.
+terms themselves, so the normal equations are never formed. Production path: **one cold
+solve at the finest grid under the BPX multilevel preconditioner** (`bpx=True`; the ladder
+grids become its levels). The coarse-to-fine ladder with a Greville-aligned warm start
+remains as the `bpx=False` fallback.
+
+The solver carries **no implicit regulariser**: regularisation is rows (a ridge is a row,
+a prior is a row), and every solver device — the CG iteration budget, the LM damping, the
+BPX floor (a division guard on each level's diagonal), the step budget, the cold start —
+is a convergence device whose value must not shape the answer. A truncated CG on an
+unpreconditioned system *is* a Krylov regulariser; that is precisely why BPX exposed
+ill-posed objectives the ladder had been hiding, and why the fix belongs in the rows.
+Convergence is a fixed step budget for now; stopping at stabilisation is the open item.
+
+Callers can supply `rows` as a callable `grid -> (rows, ops)` re-asked every
+`resample_every` steps (rotating collocation, mass schedules), a `callback(grid, step,
+opt)`, an `init=(coef, grid)` warm start, and `tau`/`tau_end` for the wrapped rows.
+See `PERFORMANCE.md` for recorded performance items.
 
 ## Dependencies
 
@@ -106,6 +129,8 @@ PYTHONPATH=~/projects/volkano python3 -c "import vkjet; print(vkjet.__version__)
 PYTHONPATH=~/projects/volkano python3 tests/test_bspline_vendor.py   # vendor == upstream
 PYTHONPATH=~/projects/volkano python3 tests/test_fit_rows.py         # end-to-end, JIT == generic
 PYTHONPATH=~/projects/volkano python3 tests/test_genkernel.py        # JIT parity + cache integrity
+PYTHONPATH=~/projects/volkano python3 tests/test_wrapped_rows.py     # congruence rows: oracle, FD, JIT parity
+PYTHONPATH=~/projects/volkano python3 tests/test_fuzz.py             # jittered rows: parity, determinism, sigma->0
 ```
 
 `shaders/build.sh` rebuilds the static SPIR-V (`eqrow_*`, `kernel_apply`, the CG/vector
