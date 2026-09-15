@@ -17,14 +17,15 @@ The per-(sample, combo) weight/index for dim d is
     weight   *= horner(coefficients[coef_row, idx, :], ix_frac)   # low->high
     prim     += wrap * pstride[d]
 
-The polynomials come from the vendored Cox-de Boor generator in
-:mod:`vkjet._gs` — vkjet has no external spline dependency.
+The polynomials come from the Cox-de Boor generator in :mod:`vkjet.bspline`
+over a :class:`vkjet.knot_vector.KnotVector`.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from ._gs import compute_bspline, KnotVector
+from .bspline import compute_bspline
+from .knot_vector import KnotVector
 
 
 class Basis1D:

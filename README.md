@@ -110,9 +110,8 @@ See `PERFORMANCE.md` for recorded performance items.
 
 - [volkano](https://pypi.org/project/volkano/) — the Vulkan binding, installed from PyPI
   as a regular dependency.
-- The B-spline basis generator is **vendored** in `vkjet/_gs` (from `genspline`), so
-  there is no external spline dependency. `tests/test_bspline_vendor.py` cross-checks
-  the vendored copy against upstream bit-for-bit whenever upstream is importable.
+- The B-spline basis generator (`knot_vector`, `polynomial`, `piecewise`, `bspline`)
+  lives in this package, so there is no external spline dependency.
 
 A GLSL compiler (`glslc`, or `glslangValidator` ≥ ~10) is **optional**: it enables the
 JIT tier. Without one everything still runs, on the generic kernel, at roughly 5× the
@@ -126,7 +125,6 @@ python3 -c "import vkjet; print(vkjet.__version__)"
 ## Tests
 
 ```bash
-python3 tests/test_bspline_vendor.py   # vendor == upstream
 python3 tests/test_fit_rows.py         # end-to-end, JIT == generic
 python3 tests/test_genkernel.py        # JIT parity + cache integrity
 python3 tests/test_wrapped_rows.py     # congruence rows: oracle, FD, JIT parity

@@ -1,6 +1,6 @@
 import math
 
-from .basis import Basis, Pieces
+from .piecewise import Basis, Pieces
 from .polynomial import Polynomial
 
 

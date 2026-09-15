@@ -22,11 +22,14 @@ measurement, so lambda knobs are row weights, spatially varying enforcement is
 a weight column, spatially varying coefficients ride the per-row payload, and
 an experiment is a file diff.
 
-Dependencies: volkano + numpy. The B-spline basis generator is vendored
-(vkjet._gs); a GLSL compiler (glslc or glslangValidator) is optional and only
-enables the JIT tier — without it everything runs on the generic kernel.
+Dependencies: volkano + numpy. A GLSL compiler (glslc or glslangValidator) is
+optional and only enables the JIT tier — without it everything runs on the
+generic kernel.
 """
 from .basis import Basis1D                                        # noqa: F401
+from .bspline import compute_bspline                              # noqa: F401
+from .knot_vector import KnotVector                               # noqa: F401
+from .piecewise import Basis, Pieces                              # noqa: F401
 from .context import Context, Buffer, ComputeProgram, STORAGE, UNIFORM  # noqa: F401,E501
 from .data import (Axes, make_rows, merge_rows, merge_row_sets,   # noqa: F401
                    save_rows, load_rows, data_operator,

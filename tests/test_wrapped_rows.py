@@ -9,7 +9,7 @@
   3. m = 0 rows: the wrapped kernels reproduce the plain LS numbers exactly.
   4. per-op JIT vs generic parity on mixed-m rows (verify_generated).
 
-Run: PYTHONPATH=~/genspline .venv/bin/python tests/test_wrapped_rows.py
+Run: .venv/bin/python tests/test_wrapped_rows.py
 """
 import os
 import sys

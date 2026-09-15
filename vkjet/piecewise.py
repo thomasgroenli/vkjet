@@ -1,3 +1,8 @@
+"""Piecewise-polynomial bases over a knot vector, in look-back storage.
+
+:class:`Basis` is the symbolic form (one :class:`Pieces` dict per interval);
+:meth:`Basis.dense` materialises the tensor :class:`vkjet.basis.Basis1D` consumes.
+"""
 import math
 
 import numpy as np

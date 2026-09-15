@@ -4,7 +4,7 @@ Covers what the audit found missing: all FOUR generated kernels (loss, grad,
 diag, hvp) rather than loss+grad, the boundary cells of every dimension, the
 cache-key ≡ emitted-code invariant, and rejection of damaged cache entries.
 
-Run: PYTHONPATH=~/genspline python3 tests/test_genkernel.py
+Run: python3 tests/test_genkernel.py
 """
 import os
 import sys

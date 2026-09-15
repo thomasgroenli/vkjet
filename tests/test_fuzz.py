@@ -15,7 +15,7 @@ Gates:
   4. sigma -> 0 recovers the unfuzzed objective
   5. rows at the domain edge stay in-domain (no NaN from a point jittered out)
 
-Run: PYTHONPATH=~/genspline python3 tests/test_fuzz.py
+Run: python3 tests/test_fuzz.py
 """
 import os
 import sys
