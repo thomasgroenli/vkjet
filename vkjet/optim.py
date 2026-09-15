@@ -97,6 +97,9 @@ class GaussNewtonCG:
         self.mu_rel = 1e-2      # CG conditions the off-diagonal → μ only covers the null space
         self.nu = 2.0           # Nielsen reject-growth factor
         self.last_loss = None
+        self.last_pred = None   # predicted decrease of the last ACCEPTED step: the damped,
+        self.last_actual = None # Krylov-truncated Newton decrement (affine-invariant, units
+                                # of the objective) and the measured decrease beside it
         self.last_alpha = 1.0   # accepted line-search step (diagnostic)
         self.gate_frac = 0.0    # fraction of coordinates SNR-gated (diagnostic)
         self._cnorm = 0.0
@@ -368,6 +371,7 @@ class GaussNewtonCG:
         its per-coordinate SNR is high, physics elsewhere. Records the gated fraction
         in self.gate_frac."""
         nbytes = self.n * 4
+        self.last_pred = self.last_actual = None
         self.grad.zero()
         for t in terms:
             t.accumulate(self.coef, self.grad)                 # g = ∇L
@@ -435,6 +439,7 @@ class GaussNewtonCG:
                                   mu_rel_min)
                 self.nu = 2.0
                 self.last_loss = L1
+                self.last_pred = float(pred); self.last_actual = float(actual)
                 accepted = True
                 break
             self.mu_rel = min(self.mu_rel * self.nu, mu_rel_max); self.nu *= 2.0

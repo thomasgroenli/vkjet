@@ -235,7 +235,7 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
              periodic=(True, False, False, False), dispatch=True,
              resample_every=0, bpx=False, bpx_floor=1e-2,
              tau=0.0, tau_end=None, init=None, callback=None, seed=0,
-             ctx=None, verbose=True):
+             stop_rel=0.0, stop_window=5, ctx=None, verbose=True):
     """Fit a spline field from jet rows (array pair, or a save_rows path).
 
     `rows` may also be a CALLABLE grid -> (rows, ops): it is asked once per
@@ -266,8 +266,26 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
 
     `init` = (coef, grid): warm-start the first stage from a field on another
     grid (resized as the ladder does between stages). `callback(grid, step,
-    opt)` runs after every accepted step. A fixed step budget is the
-    convergence rule here; stopping at stabilisation is the open item.
+    opt)` runs after every step.
+
+    CONVERGENCE. `steps` is the budget. With ``stop_rel > 0`` the solve also
+    stops when the objective has STABILISED: the mean over the last
+    `stop_window` accepted steps of pred/L <= stop_rel, where pred is the
+    accepted step's predicted decrease — the damped, Krylov-truncated Newton
+    decrement, affine-invariant and in the units of the objective, so pred/L
+    means the same thing across grids, row counts and clips (||g|| is neither,
+    and not even monotone under LM). It is a statement that the ROW SYSTEM IS
+    SOLVED, never that the answer is good: a fit that worsens as it converges
+    is a row problem, and stopping early would be a regulariser in the solver.
+    ONE FLOOR, MEASURED: before the solve the gradient is evaluated twice at
+    the same coefficients; their disagreement is the arithmetic floor (fp32
+    atomic order, ~3e-7). With jittered rows it is evaluated again with two
+    seeds, which is the statistical floor of a stochastic objective (the same
+    mechanism a minibatched solve will use). stop_rel below the floor is
+    thresholding noise and is reported as such. A second condition is free:
+    two consecutive LM rejections at maximum damping mean no descent
+    direction is left. The diagnostics carry `pred_rel` per accepted step,
+    `steps_used` and `floor`.
 
     Returns a :class:`FitResult`.
     """
@@ -494,6 +512,41 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
                 t.loss(opt.coef, loss_buf)
             return float(loss_buf.download(np.float32, 1)[0])
 
+        # THE FLOOR, measured — but not at the cold start: at coef = 0 every
+        # physics residual vanishes for every jitter draw, so the probe must run
+        # at a non-trivial point. It runs after the first accepted step: two
+        # gradients at the same coefficients and seed (arithmetic), and with
+        # jittered rows two more seeds (statistical).
+        floor = None
+
+        def _measure_floor():
+            def _grad(seed_):
+                for _t in terms:
+                    if _anyfuzz and hasattr(_t, "set_seed"):
+                        _t.set_seed(seed_)
+                gb = ctx.buffer(4 * n); gb.zero()
+                for _t in terms:
+                    _t.accumulate(opt.coef, gb)
+                return gb.download(np.float32, n).astype(np.float64)
+            sd = _seed0 + 1
+            ga, gb_ = _grad(sd), _grad(sd)
+            gnorm = max(np.linalg.norm(ga), 1e-30)
+            fl = float(np.linalg.norm(ga - gb_) / gnorm)
+            if _anyfuzz:
+                gc = _grad(sd + 100003)
+                fl = max(fl, float(np.linalg.norm(ga - gc) / gnorm))
+                for _t in terms:                       # restore the step's draw
+                    if hasattr(_t, "set_seed"):
+                        _t.set_seed(_seed0 + 1)
+            if verbose:
+                print(f"  [stop] gradient floor {fl:.2e}"
+                      f"{' (arithmetic + jitter)' if _anyfuzz else ' (arithmetic)'}; "
+                      f"stop when mean(pred/L) over {stop_window} steps <= {stop_rel:.1e}"
+                      + ("  WARNING: stop_rel <= floor, thresholding noise" if stop_rel <= fl else ""),
+                      flush=True)
+            return fl
+        pred_rel = []; _rej = 0; steps_used = n_steps
+
         for _k in range(n_steps):
             if resample_every and _k and per_stage and _k % resample_every == 0:
                 stage_rows, ops = rows(grid)
@@ -514,9 +567,30 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
                     if hasattr(_t, "set_seed"):
                         _t.set_seed(_seed0 + _k)
                 opt.last_loss = None
-            opt.step(terms, loss_fn, cg_iters=cg_iters)
+            _, accepted, _ = opt.step(terms, loss_fn, cg_iters=cg_iters)
             if callback is not None:
                 callback(grid, _k + 1, opt)
+            if accepted and opt.last_pred is not None:
+                pred_rel.append(opt.last_pred / max(abs(opt.last_loss), 1e-30)); _rej = 0
+            else:
+                pred_rel.append(np.nan); _rej += 1
+            if stop_rel > 0.0 and floor is None and accepted:
+                floor = _measure_floor()
+                opt.last_loss = None if _anyfuzz else opt.last_loss
+            if stop_rel > 0.0:
+                recent = [v for v in pred_rel[-stop_window:] if np.isfinite(v)]
+                if len(recent) == stop_window and float(np.mean(recent)) <= stop_rel:
+                    steps_used = _k + 1
+                    if verbose:
+                        print(f"  [stop] stabilised at step {steps_used}: mean(pred/L) "
+                              f"{float(np.mean(recent)):.2e} <= {stop_rel:.1e}", flush=True)
+                    break
+                if _rej >= 2 and opt.mu_rel >= 1e3:
+                    steps_used = _k + 1
+                    if verbose:
+                        print(f"  [stop] no descent direction at step {steps_used} "
+                              f"(two rejections at maximum damping)", flush=True)
+                    break
         coef, prev = opt.get_coef(), grid
         losses.append(opt.last_loss)
         if verbose:
@@ -524,6 +598,7 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
                   f"({time.time()-t0:.0f}s)", flush=True)
 
     diag = {"stage_losses": losses, "seconds": time.time() - t0,
-            "row_order": row_order}
+            "row_order": row_order, "pred_rel": pred_rel, "steps_used": steps_used,
+            "floor": floor}
     return FitResult(ctx, coef, axes, bases, extents, losses,
                      n_channels=n_channels, diagnostics=diag)

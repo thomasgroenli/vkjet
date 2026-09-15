@@ -140,6 +140,7 @@ def make_rows(x, op, w, s, c=None, nyquist=0.0, fuzz=0.0):
         c = np.asarray(c, np.float32).reshape(len(x), -1)
         a["c"][:, :c.shape[1]] = c
     a["nyquist"] = nyquist
+    a["fuzz"] = fuzz
     return a
 
 

@@ -190,5 +190,17 @@ def main():
     ctx.destroy()
 
 
+def test_make_rows_carries_fuzz():
+    """The authoring entry point must carry the column (it once silently dropped it)."""
+    from vkjet.data import make_rows, merge_row_sets, data_operator
+    ops, did = data_operator(None)
+    r = make_rows(np.zeros((3, 4), np.float32), np.zeros(3, np.int32), np.ones(3, np.float32),
+                  np.zeros(3, np.float32), nyquist=1.5, fuzz=0.5)
+    m, _ = merge_row_sets((r, ops))
+    assert np.all(r["fuzz"] == 0.5) and np.all(m["fuzz"] == 0.5) and np.all(m["nyquist"] == 1.5)
+    print("  make_rows carries fuzz and nyquist through merge: OK")
+
+
 if __name__ == "__main__":
+    test_make_rows_carries_fuzz()
     main()
