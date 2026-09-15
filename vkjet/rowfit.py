@@ -116,7 +116,8 @@ def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose,
 
     Payload-free operators that share an IDENTICAL point set fuse into one
     shared-gather kernel; the rest get a per-operator kernel. Returns
-    (terms, handled_mask); anything not handled is left to the generic term.
+    (terms, handled_mask) with terms as (term, frozenset of op ids) pairs;
+    anything not handled is left to the generic term.
 
     Wrapped rows (modulus m > 0: r = 0 mod m) and jittered rows (fuzz > 0)
     ride the per-row record. The grouped kernel carries no modulus, so an
@@ -175,7 +176,7 @@ def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose,
             W = np.stack([w[r] for _, r in members], 1)
             S = np.stack([s[r] for _, r in members], 1)
             gt.bind_points(axes.encode(xp), W, S, sigma=sg)
-            terms.append(gt)
+            terms.append((gt, frozenset(gids)))
             for _, r in members:
                 handled[r] = True
             if verbose:
@@ -197,7 +198,7 @@ def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose,
                           w[m], s[m], c[m],
                           fuzz=(None if fz is None else fz[m]),
                           modulus=(None if mm is None else mm[m]))
-            terms.append(gt)
+            terms.append((gt, frozenset([int(k)])))
             handled |= m
         except Exception as ex:
             if verbose:
@@ -335,14 +336,14 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
                 r = ~hd
                 gen.bind_batch(ax_.encode(xx[r]), oo[r], ww[r], ss[r], cc[r],
                                fuzz=ff[r], modulus=mq[r])
-                tt.append(gen)
+                tt.append((gen, frozenset(int(k) for k in np.unique(oo[r]))))
             if verbose_:
                 print(f"    [dispatch] jit {int(hd.sum()):,}  "
                       f"generic {int((~hd).sum()):,}", flush=True)
         else:
             t_ = EqRowTerm(ctx, bs_, iw_, ops_)
             t_.bind_batch(ax_.encode(xx), oo, ww, ss, cc, fuzz=ff, modulus=mq)
-            tt = [t_]
+            tt = [(t_, frozenset(int(k) for k in np.unique(oo)))]
         return tt
 
     if not per_stage:
@@ -371,15 +372,66 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
         opt = GaussNewtonCG(ctx, n); opt.set_coef(coef)
         _tau_now = [float(tau)]
         _first = [True]
+        bound = {}          # opset -> dict(term, keys{op: content key}, w0{op: w}, scale)
 
         def build_terms():
-            tt = make_terms(axes, bases, grid, x, op, w, s, c, fz, mq, ops,
-                            verbose and si == 0 and _first[0])
+            """Terms for the CURRENT rows. On a re-author, an operator whose
+            rows (x, s, payload, m, fuzz) are unchanged keeps its bound term;
+            if only its weights changed by one common factor the factor
+            becomes the term's scale (w·r ≡ scale·w — the objective is the
+            same, no rebind); anything else is rebound. Rows stay the whole
+            specification; this is representation, not content."""
+            first = not bound
+            keys = {}; wnow = {}
+            for k in np.unique(op):
+                sel = op == k
+                h = hashlib.blake2b(digest_size=16)
+                for a in (x[sel], s[sel], c[sel], mq[sel], fz[sel]):
+                    h.update(np.ascontiguousarray(a).tobytes())
+                keys[int(k)] = h.digest(); wnow[int(k)] = w[sel]
+            keep, changed = [], set(keys)
+            n_kept = n_scaled = 0
+            for opset, rec in list(bound.items()):
+                if not opset <= set(keys) or any(keys[k] != rec["keys"][k] for k in opset):
+                    continue
+                ratios = []
+                for k in opset:
+                    w0, w1 = rec["w0"][k], wnow[k]
+                    if w0.shape != w1.shape:
+                        ratios = None; break
+                    if np.array_equal(w0, w1):
+                        ratios.append(1.0); continue
+                    r = float(np.median(w1[w0 > 0] / w0[w0 > 0])) if (w0 > 0).any() else None
+                    if r is None or not np.allclose(w1, r * w0, rtol=2e-6, atol=0.0):
+                        ratios = None; break
+                    ratios.append(r)
+                if ratios is None or not np.allclose(ratios, ratios[0], rtol=1e-6):
+                    continue
+                r = ratios[0]
+                if r != rec["scale"]:
+                    if not hasattr(rec["term"], "set_scale") or len(opset) > 1:
+                        continue          # no scale interface (grouped): rebind
+                    rec["term"].set_scale(r); rec["scale"] = r; n_scaled += 1
+                keep.append(opset); changed -= opset; n_kept += 1
+            for opset in list(bound):
+                if opset not in keep:
+                    del bound[opset]
+            new = []
+            if changed:
+                sel = np.isin(op, sorted(changed))
+                new = make_terms(axes, bases, grid, x[sel], op[sel], w[sel], s[sel], c[sel],
+                                 fz[sel], mq[sel], ops, verbose and si == 0 and _first[0])
+                for t_, opset in new:
+                    if hasattr(t_, "set_tau"):
+                        t_.set_tau(_tau_now[0])
+                    bound[opset] = dict(term=t_, keys={k: keys[k] for k in opset},
+                                        w0={k: wnow[k].copy() for k in opset}, scale=1.0)
+            if verbose and not first:
+                n_re = int(sum(len(bound[o]["w0"][k]) for _, o in new for k in o))
+                print(f"    [rebind] {n_kept} term(s) kept ({n_scaled} rescaled), "
+                      f"{len(new)} rebound ({n_re:,} rows)", flush=True)
             _first[0] = False
-            for t_ in tt:
-                if hasattr(t_, "set_tau"):
-                    t_.set_tau(_tau_now[0])
-            return tt
+            return [rec["term"] for rec in bound.values()]
 
         terms = build_terms()
         if verbose and si == 0 and (mq > 0).any():
@@ -407,8 +459,8 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
                         xl, ol, wl, sl, cl, fl, ml, _ = unpack(rr_, oo_, g)
                     else:
                         xl, ol, wl, sl, cl, fl, ml, oo_ = x, op, w, s, c, fz, mq, ops
-                    tt = make_terms(ax_l, bs_l, g, xl, ol, wl, sl, cl, fl, ml,
-                                    oo_, False)
+                    tt = [t_ for t_, _ in make_terms(ax_l, bs_l, g, xl, ol, wl, sl,
+                                                     cl, fl, ml, oo_, False)]
                     for t_ in tt:
                         if hasattr(t_, "set_tau"):
                             t_.set_tau(_tau_now[0])
