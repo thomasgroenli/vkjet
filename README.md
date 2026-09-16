@@ -8,14 +8,15 @@ kernels generated per operator at run time.
 from vkjet import Axes, OperatorTable, make_rows, merge_row_sets, \
                   data_operator, fit_rows, SLOT_DX, SLOT_DY, SLOT_DZ
 
-ops = OperatorTable()
+ops = OperatorTable()                      # n_channels=5 unless declared otherwise
 cid = ops.add_op("continuity", lin=[(SLOT_DX, 0, 1.0),
                                     (SLOT_DY, 1, 1.0),
                                     (SLOT_DZ, 2, 1.0)])
-rows = make_rows(x_colloc, np.full(n, cid, np.int32), w, s)
+rows = make_rows(x_colloc, np.full(n, cid, np.int32), w, s, fuzz=0.5)
 
-res = fit_rows(rows, ops, lo=lo, hi=hi, base_grid=(6, 6, 6, 10), n_stages=4)
-u   = res.forward(x_query)          # (N, 5)
+res = fit_rows(rows, ops, lo=lo, hi=hi, base_grid=(6, 6, 6, 10), n_stages=4,
+               bpx=True, steps=80, stop_rel=1e-5)
+u   = res.forward(x_query)          # (N, n_channels)
 ```
 
 ## The model
@@ -23,7 +24,7 @@ u   = res.forward(x_query)          # (N, 5)
 Every row is `(x, op_id, w, s, c[8], m, fuzz)`. The operator table defines, at the row's point,
 
 ```
-r = ⟨L, J(f)(x)⟩ + JᵀQJ − s          loss += ½ · scale · w · ρ_m(r)
+r = c₀ + ⟨L, J(f)(x)⟩ + JᵀQJ − s          loss += ½ · scale · w · ρ_m(r)
 ```
 
 with `ρ_m(r) = r²` for `m = 0` and, for `m > 0`, the wrapped Gaussian: the row asserts the
@@ -36,18 +37,24 @@ unwrapping is rows too (pair rows on the Itoh condition, authored by the caller)
 measure about `x`, not a point (a fixed collocation set gets overfitted).
 
 `J(f)(x)` is the second-order jet: **15 slots** (`val`, `∂t ∂x ∂y ∂z`, `∂tt ∂xx ∂yy ∂zz`,
-`∂t∂x … ∂y∂z`) × **5 channels**. `L` is a sparse covector on that jet, `Q` a sparse
-quadratic form. An operator is registered once and referenced by every row that uses it:
+`∂t∂x … ∂y∂z`) × **`n_channels`** channels. The channel count is part of the objective, not a
+solver knob: it is declared on the table (`OperatorTable(n_channels=...)`, default 5) and
+carried by the row file. `L` is a sparse covector on the jet, `Q` a sparse quadratic form,
+`c₀` the order-0 terms of the same polynomial. An operator is registered once and referenced
+by every row that uses it:
 
 ```python
 ops.add_op(name,
-           lin =[(slot, ch, val, cix)],            # ⟨L, J⟩
-           quad=[(s1, c1, s2, c2, val, cix)])      # JᵀQJ
+           const=[(val, cix)],                     # c₀   (order 0)
+           lin  =[(slot, ch, val, cix)],           # ⟨L, J⟩
+           quad =[(s1, c1, s2, c2, val, cix)])     # JᵀQJ
 ```
 
 `cix ≥ 0` multiplies that entry by the row's payload `c[cix]`, so one shared operator
 serves a million different per-row covectors (beam directions, wall normals) or a
-spatially varying coefficient — `ν(x)`, a graded weight — without a new kernel.
+spatially varying coefficient — `ν(x)`, a graded weight — without a new kernel. The `s`
+column is the order-0 term with a hard-coded minus sign; a `const` entry with `cix ≥ 0`
+expresses the same per-row target through the payload, and the two agree to the bit.
 
 **Physics are rows.** Collocation points are explicit rows and a PDE is a measurement.
 λ knobs are row weights, spatially varying enforcement is a weight column, sources and
@@ -88,8 +95,8 @@ today, and any edit to the generator invalidates it automatically.
 Matrix-free Gauss-Newton CG with Levenberg-Marquardt damping. `H_GN·v` comes from the
 terms themselves, so the normal equations are never formed. Production path: **one cold
 solve at the finest grid under the BPX multilevel preconditioner** (`bpx=True`; the ladder
-grids become its levels). The coarse-to-fine ladder with a Greville-aligned warm start
-remains as the `bpx=False` fallback.
+grids become its levels and a scalar `steps` is the whole budget). The coarse-to-fine
+ladder with a Greville-aligned warm start remains as the `bpx=False` default.
 
 The solver carries **no implicit regulariser**: regularisation is rows (a ridge is a row,
 a prior is a row), and every solver device — the CG iteration budget, the LM damping, the
@@ -97,12 +104,39 @@ BPX floor (a division guard on each level's diagonal), the step budget, the cold
 is a convergence device whose value must not shape the answer. A truncated CG on an
 unpreconditioned system *is* a Krylov regulariser; that is precisely why BPX exposed
 ill-posed objectives the ladder had been hiding, and why the fix belongs in the rows.
-Convergence is a fixed step budget for now; stopping at stabilisation is the open item.
 
-Callers can supply `rows` as a callable `grid -> (rows, ops)` re-asked every
-`resample_every` steps (rotating collocation, mass schedules), a `callback(grid, step,
-opt)`, an `init=(coef, grid)` warm start, and `tau`/`tau_end` for the wrapped rows.
-See `PERFORMANCE.md` for recorded performance items.
+### Convergence
+
+`steps` is the budget. With `stop_rel > 0` the solve also stops when the objective has
+**stabilised**: the mean over the last `stop_window` accepted steps of `pred/L` falls below
+`stop_rel`, where `pred` is the accepted step's predicted decrease — the damped,
+Krylov-truncated Newton decrement. It is affine-invariant and in the units of the
+objective, so `pred/L` means the same thing across grids, row counts and clips (`‖g‖` is
+neither, and not even monotone under LM). Two consecutive LM rejections at maximum damping
+also stop the solve: no descent direction is left.
+
+The threshold is checked against **one measured floor**, taken after the first accepted
+step (at the cold start every physics residual is zero for every draw): the gradient is
+evaluated twice at the same coefficients for the arithmetic floor (fp32 atomic order), and
+with jittered rows once more at a second seed for the statistical floor of a stochastic
+objective. A `stop_rel` at or below the floor is thresholding noise and is reported as such.
+
+Stopping is a statement that the **row system is solved**, never that the answer is good: a
+fit that worsens as it converges is a row problem, and stopping early would be a
+regulariser in the solver. `res.diagnostics` carries `pred_rel` per accepted step,
+`steps_used` and `floor`.
+
+### Re-authoring during the solve
+
+`rows` may be a callable `grid -> (rows, ops)`, asked once per stage and again every
+`resample_every` steps (rotating collocation, weight schedules). Each answer is diffed
+against the bound system **per operator**: an operator whose rows `(x, s, c, m, fuzz)` are
+unchanged keeps its bound term; one whose weights changed by a single common factor keeps
+its term with the factor as the term's `scale` (`w·r ≡ scale·w`); only operators whose
+content actually changed are repacked and uploaded. The objective is identical to
+rebinding everything. Also available: a `callback(grid, step, opt)` after every step, an
+`init=(coef, grid)` warm start resized as the ladder does, and `tau`/`tau_end` for the
+wrapped rows. See `PERFORMANCE.md` for recorded performance items.
 
 ## Dependencies
 
@@ -129,10 +163,15 @@ python3 tests/test_fit_rows.py         # end-to-end, JIT == generic
 python3 tests/test_genkernel.py        # JIT parity + cache integrity
 python3 tests/test_wrapped_rows.py     # congruence rows: oracle, FD, JIT parity
 python3 tests/test_fuzz.py             # jittered rows: parity, determinism, sigma->0
+python3 tests/test_const_term.py       # order-0 term in the table == the s column
+python3 tests/test_nchannels.py        # declared channel count vs the numpy oracle
+python3 tests/test_bpx_separable.py    # separable transfer == tensor product, P^T exact adjoint
+python3 tests/test_rebind.py           # re-author without rebinding == rebind-all
+python3 tests/test_stop.py             # stopping at stabilisation: floor, window, budget
 ```
 
-`shaders/build.sh` rebuilds the static SPIR-V (`eqrow_*`, `kernel_apply`, the CG/vector
-ops). The JIT kernels are not built here — they are generated at run time.
+`shaders/build.sh` rebuilds the static SPIR-V (`eqrow_*`, `kernel_apply`, `axis_csr`, the
+CG/vector ops). The JIT kernels are not built here — they are generated at run time.
 
 ## Scope
 
