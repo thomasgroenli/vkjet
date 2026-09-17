@@ -151,6 +151,12 @@ rebinding everything. Also available: a `callback(grid, step, opt)` after every 
 `init=(coef, grid)` warm start resized as the ladder does, and `tau`/`tau_end` for the
 wrapped rows. See `PERFORMANCE.md` for recorded performance items.
 
+## Design record
+
+`DESIGN.md` records why the package is shaped this way: the contract and what was
+deliberately left out of it, the principles with the measurements behind them, the findings
+that shaped the optimiser, and the open items. `PERFORMANCE.md` records performance items.
+
 ## Dependencies
 
 **volkano + numpy.** That is the whole list.
