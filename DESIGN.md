@@ -207,7 +207,17 @@ small fits, a few percent at a million records where the work is already compute
 
 - **BPX cold solve retired the ladder (2026-09-05).** One cold solve at the finest grid
   under the multilevel preconditioner beats the staged ladder at matched loss, once the
-  transfers were made separable and the adjoint exact. The cost frontier measured then:
+  transfers were made separable and the adjoint exact. The per-axis factor was, until
+  2026-09-17, a Greville-aligned linear interpolation of coefficients in index space: not
+  knot insertion, off by 25 % rms on a random coarse field, and resting on three
+  uniform-grid assumptions (equal Greville spacing, one refinement ratio, integer knots).
+  It is now exact knot insertion by the Oslo algorithm on nested knot vectors, which is
+  what separability was always licensing: the spline space is a tensor product, so the
+  prolongation is a Kronecker product of 1D refinement matrices for any knot vectors.
+  Measured on the in vivo recipe at the same 50 steps: loss 13313 → 12930 and the blood
+  residual 0.0938 → 0.0927, same objective, same time — a convergence gain, as a
+  preconditioner change must be. Non-uniform knots would still need the encode and the
+  per-axis derivative scaling generalised; the transfer no longer stands in the way. The cost frontier measured then:
   a step is ~17× a CG iteration; cg 12 at 50 steps dominates cg 6 at 105; 3-stage
   semi-convergence peaks around step 35. The ladder remains as the warm start for aliased
   data and as `bpx=False`.
@@ -253,6 +263,7 @@ small fits, a few percent at a million records where the work is already compute
 | 2026-09-15 | lateral amplification by the diagonal preconditioner, mechanism confirmed bit-exactly | acquisition-frame channels; no geometry in the solver |
 | 2026-09-15 | `make_rows` silently dropped `fuzz`; all "fuzz" runs were unjittered | regression test; retracted claims |
 | 2026-09-17 | folding scales the modulus; K = 1 minibatch is an exact alias | contract as stated in §2 |
+| 2026-09-17 | the BPX transfer was linear interpolation, 25 % off on a rough field | exact knot insertion (Oslo); loss −2.9 % at a fixed budget |
 
 ## 7. Open items
 

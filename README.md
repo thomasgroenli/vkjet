@@ -111,7 +111,10 @@ solve is recorded once into a command sequence and re-submitted per solve (one f
 instead of one per dispatch), under the diagonal and the BPX preconditioner alike; an LM
 retry with a new μ re-uploads one meta buffer and re-submits. Production path: **one cold
 solve at the finest grid under the BPX multilevel preconditioner** (`bpx=True`; the ladder
-grids become its levels and a scalar `steps` is the whole budget). The coarse-to-fine
+grids become its levels and a scalar `steps` is the whole budget). The level transfers are
+exact knot insertion (the Oslo algorithm, one factor per axis, `rowfit.refine_matrix`): a
+coarse field prolonged to a finer nested grid is the same field to float precision, and the
+restriction is the exact transpose. The same factor resizes a warm start along the ladder. The coarse-to-fine
 ladder with a Greville-aligned warm start remains as the `bpx=False` default.
 
 The solver carries **no implicit regulariser**: regularisation is rows (a ridge is a row,
