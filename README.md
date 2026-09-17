@@ -171,20 +171,33 @@ python3 -c "import vkjet; print(vkjet.__version__)"
 
 ## Tests
 
+The suite ships with the package as `vkjet.tests` (plain `unittest`, one shared Vulkan
+context, JIT tests skipped without a GLSL compiler):
+
 ```bash
-python3 tests/test_fit_rows.py         # end-to-end, JIT == generic
-python3 tests/test_genkernel.py        # JIT parity + cache integrity
-python3 tests/test_wrapped_rows.py     # congruence rows: oracle, FD, JIT parity
-python3 tests/test_fuzz.py             # jittered rows: parity, determinism, sigma->0
-python3 tests/test_const_term.py       # order-0 term in the table == the s column
-python3 tests/test_nchannels.py        # declared channel count vs the numpy oracle
-python3 tests/test_bpx_separable.py    # separable transfer == tensor product, P^T exact adjoint
-python3 tests/test_rebind.py           # re-author without rebinding == rebind-all
-python3 tests/test_stop.py             # stopping at stabilisation: floor, window, budget
-python3 tests/test_system.py           # Field / RowSystem / Solve object layer
-python3 tests/test_minibatch.py        # K=1 == full solve; norm-test batcher
-python3 tests/test_rowauthor.py        # weight folding == the same objective (both tiers, wrapped rows)
+python -m vkjet.tests                 # everything (~2 min on a desktop GPU)
+python -m vkjet.tests -v test_eqrow   # one module, class or method
 ```
+
+| module | what it referees |
+|---|---|
+| `test_apply` | GPU tensor-product apply == numpy oracle, 1D..4D and mixed orders |
+| `test_eqrow` | generic kernels vs the float64 oracle on every slot class: loss, grad, hvp, diag, scale, file round trip |
+| `test_genkernel` | JIT parity on all four kernels, cache key ≡ code, damaged cache, degenerate ops, verify catches sabotage |
+| `test_wrapped_rows` | congruence rows: oracle, FD, m = 0 identity, JIT parity |
+| `test_fuzz` | jittered rows: inert at σ = 0, seed determinism, σ → 0, boundary, JIT and grouped parity |
+| `test_const_term` | order-0 term in the table == the `s` column; the JIT specialises it |
+| `test_nchannels` | declared channel count vs the oracle |
+| `test_rowauthor` | weight folding is the same objective on both tiers, wrapped rows included |
+| `test_cmd_batching` | captured CG solve == per-dispatch solve; μ reuse; rebind re-records |
+| `test_exact_newton` | quartic exactness, ε-free Newton HVP, curvature ground truth, line search |
+| `test_bpx_separable` | separable transfer == tensor product, Pᵀ exact adjoint |
+| `test_fit_rows` | end to end: JIT == generic, a divergence-free field recovered |
+| `test_rebind` | re-author without rebinding == rebind-all |
+| `test_stop` | stopping at stabilisation: floor, window, budget |
+| `test_minibatch` | K=1 == full solve; partition; norm-test batcher; JIT tiers |
+| `test_system` | Field / RowSystem / Solve object layer == fit_rows |
+| `test_teardown` | context manager, idempotent destroy, buffer churn, the atexit path |
 
 `shaders/build.sh` rebuilds the static SPIR-V (`eqrow_*`, `kernel_apply`, `axis_csr`, the
 CG/vector ops). The JIT kernels are not built here — they are generated at run time.

@@ -10,11 +10,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "volkano>=0.1.0"]
 
-[project.optional-dependencies]
-dev = ["pytest"]
 
 [tool.setuptools]
-packages = ["vkjet"]
+packages = ["vkjet", "vkjet.tests"]
 include-package-data = true
 
 [tool.setuptools.package-data]
