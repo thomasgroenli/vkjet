@@ -59,7 +59,20 @@ expresses the same per-row target through the payload, and the two agree to the 
 **Physics are rows.** Collocation points are explicit rows and a PDE is a measurement.
 λ knobs are row weights, spatially varying enforcement is a weight column, sources and
 ALM shifts are the `s` column, and an experiment is a file diff (`rows_hash` gives a
-canonical content hash). `fit_rows` solves exactly the system it is handed — quadrature
+canonical content hash).
+
+**Weight folding** (`vkjet.rowauthor`). The weight is not part of the contract either: when
+every coefficient of an operator rides a payload slot the residual is homogeneous in the
+payload and `w·r(c)² = r(√w·c)²` exactly, so `homogenize` gives each literal-coefficient
+operator a gain slot (and, on request, moves the `s` column onto a `SLOT_CONST` target
+slot) and `fold` scales the payload by `√w`, leaving `w = 1`, `s = 0`. A wrapped row folds
+with its modulus: its loss is homogeneous of degree 2 in `(r, m)`, so `m` scales by `√w`
+too. The solver's contract is then `(x, op, payload, m, fuzz)`; "weight" and "target" are
+authoring vocabulary. The folded form is not write-hostile (`reweight` scales the payload
+and modulus by `√k`), but a weight is only recoverable where the operator has a dedicated
+gain slot (`gain_of`); a data row's payload IS its covector and the weight is gone as a
+separate quantity. Fold on the way out: the re-author diff below recognises a common
+weight factor on the `w` column, not in the payload. `fit_rows` solves exactly the system it is handed — quadrature
 adequacy, collocation density and coverage are the row author's responsibility, and
 nothing in the solver inspects or second-guesses your rows.
 
@@ -168,6 +181,9 @@ python3 tests/test_nchannels.py        # declared channel count vs the numpy ora
 python3 tests/test_bpx_separable.py    # separable transfer == tensor product, P^T exact adjoint
 python3 tests/test_rebind.py           # re-author without rebinding == rebind-all
 python3 tests/test_stop.py             # stopping at stabilisation: floor, window, budget
+python3 tests/test_system.py           # Field / RowSystem / Solve object layer
+python3 tests/test_minibatch.py        # K=1 == full solve; norm-test batcher
+python3 tests/test_rowauthor.py        # weight folding == the same objective (both tiers, wrapped rows)
 ```
 
 `shaders/build.sh` rebuilds the static SPIR-V (`eqrow_*`, `kernel_apply`, `axis_csr`, the
