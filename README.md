@@ -106,7 +106,10 @@ today, and any edit to the generator invalidates it automatically.
 ## Optimiser
 
 Matrix-free Gauss-Newton CG with Levenberg-Marquardt damping. `H_GN·v` comes from the
-terms themselves, so the normal equations are never formed. Production path: **one cold
+terms themselves, so the normal equations are never formed. The whole fixed-iteration CG
+solve is recorded once into a command sequence and re-submitted per solve (one fence
+instead of one per dispatch), under the diagonal and the BPX preconditioner alike; an LM
+retry with a new μ re-uploads one meta buffer and re-submits. Production path: **one cold
 solve at the finest grid under the BPX multilevel preconditioner** (`bpx=True`; the ladder
 grids become its levels and a scalar `steps` is the whole budget). The coarse-to-fine
 ladder with a Greville-aligned warm start remains as the `bpx=False` default.

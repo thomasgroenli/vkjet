@@ -416,16 +416,22 @@ class GaussNewtonCG:
 
     # -- batched PCG: the whole fixed-iteration solve in ONE submit ----------- #
     def _pcg_batched(self, terms, mu_abs, cg_iters):
-        """Bit-for-bit the `_pcg` dispatch chain (fixed iterations, diag
-        preconditioner), recorded once into a CommandSequence and re-submitted
+        """Bit-for-bit the `_pcg` dispatch chain (fixed iterations, diagonal or
+        BPX preconditioner), recorded once into a CommandSequence and re-submitted
         every solve — one fence instead of ~12·cg_iters. μ is the only per-solve
         host constant; it lives in its own meta buffer, re-uploaded before each
         submit (an LM retry with a new μ therefore needs NO re-record). The
-        sequence is invalidated when the term set or their bound batches change
-        (a new stage)."""
+        sequence is invalidated when the term set, their bound batches or the
+        preconditioner change (a new stage)."""
         self.vm_mu.upload(struct.pack("<i2f", self.n, mu_abs, 0.0))
-        key = (cg_iters,
+        key = (cg_iters, id(self.bpx),
                tuple((id(t), id(getattr(t, "_batch", None))) for t in terms))
+
+        def precond(r, z):                   # z = M^-1 r, capturable either way
+            if self.bpx is not None:
+                self.bpx.apply(r, z)         # per-level metas are static
+            else:
+                run(self.pdiv_p, [r, self.diag, z, self.vm_mu], groups=g)
         if self._seq_key != key:
             if self._seq is None:
                 self._seq = self.ctx.sequence()
@@ -437,7 +443,7 @@ class GaussNewtonCG:
                 self.delta.zero()
                 run(self.axpby_p, [self.grad, self.grad, self.r, self.vm_m10],
                     groups=g)                                       # r = −g
-                run(self.pdiv_p, [self.r, self.diag, self.z, self.vm_mu], groups=g)
+                precond(self.r, self.z)
                 self.ctx.copy_buffer(self.z, self.p, self.n * 4)
                 self.s_rz.zero()
                 run(self.dot_p, [self.r, self.z, self.s_rz, self.vm_00], groups=g)
@@ -459,8 +465,7 @@ class GaussNewtonCG:
                     run(self.axpby_s_p, [self.Ap, self.r, self.r,
                                          self.s_nalpha, self.s_one, self.nmeta],
                         groups=g)                                   # r −= α·Ap
-                    run(self.pdiv_p, [self.r, self.diag, self.z, self.vm_mu],
-                        groups=g)                                   # z = M⁻¹r
+                    precond(self.r, self.z)                         # z = M⁻¹r
                     self.s_rzn.zero()
                     run(self.dot_p, [self.r, self.z, self.s_rzn, self.vm_00],
                         groups=g)
@@ -525,8 +530,9 @@ class GaussNewtonCG:
             self._cnorm = math.sqrt(max(self._dot(self.coef, self.coef), 0.0))
         self.ctx.copy_buffer(self.coef, self.backup, nbytes)
         accepted = False; used = 0
-        # batched path: fixed iterations, diag preconditioner, deterministic term
-        # set (a MinibatchedTerm redraws its minibatch set per step → unbatchable)
+        # batched path: fixed iterations, diagonal OR BPX preconditioner (both are
+        # pure dispatches with static metas), deterministic term set (a
+        # MinibatchedTerm redraws its minibatch set per step → unbatchable)
         # A term may declare `stochastic`: a BatchedRowSystem does, and says False
         # at K=1, where the drawn set is the full row set every step and the
         # captured sequence stays valid. Without that, wrapping the full solve
@@ -534,7 +540,7 @@ class GaussNewtonCG:
         def _redraws(t):
             st = getattr(t, "stochastic", None)
             return hasattr(t, "batcher") if st is None else bool(st)
-        batchable = (noise == 0.0 and newton_eps == 0.0 and self.bpx is None
+        batchable = (noise == 0.0 and newton_eps == 0.0
                      and snr_gate is None and not any(_redraws(t) for t in terms))
         for _ in range(max_tries):
             mu_abs = self.mu_rel * self.diag_max

@@ -202,7 +202,8 @@ Semantics live in the file; execution is chosen per operator and never changes t
 Matrix-free Gauss-Newton CG with Levenberg-Marquardt damping. `H_GN·v` comes from the
 terms; the normal equations are never formed; CG scalars stay on the device; the whole
 fixed-iteration solve is recorded once into a command sequence and re-submitted (2× on
-small fits, a few percent at a million records where the work is already compute-bound).
+small fits, a few percent at a million records where the work is already compute-bound;
+12 % of the in vivo fit once BPX was made capturable).
 
 - **BPX cold solve retired the ladder (2026-09-05).** One cold solve at the finest grid
   under the multilevel preconditioner beats the staged ladder at matched loss, once the
@@ -265,9 +266,10 @@ small fits, a few percent at a million records where the work is already compute
 - **The statistical floor exists and no production run has used it.**
 - **Deflation** of the null space was the one validated tool of the vorticity work; not
   ported.
-- **Captured CG under BPX.** The recorded sequence covers the diagonal preconditioner
-  only; BPX solves go through the per-dispatch path.
 - **Payload on the grouped tier** (`PERFORMANCE.md`).
+- Done 2026-09-17: the captured CG solve now covers BPX (per-level metas made static);
+  on the in vivo recipe the fit went 40.5 → 35.8 s, i.e. about 17 % of the optimisation
+  stage, the rest being compute-bound as the earlier measurement predicted.
 - **Multi-point rows** (§2).
 
 ## 8. Testing doctrine

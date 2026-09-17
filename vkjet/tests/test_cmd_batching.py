@@ -5,17 +5,20 @@ and re-submitted equals the per-dispatch solve.
   B  a new μ re-uploads one meta buffer and re-submits the SAME sequence
   C  rebinding a term's batch changes the key: re-recorded, still correct
   D  full fits, batched (default) vs forced-sequential, track to fp32 noise
+  E  the same under the BPX multilevel preconditioner (its per-level metas are
+     static, so the apply records into the sequence)
 """
 import unittest
 
 import numpy as np
 
+from vkjet.bpx import BpxPreconditioner
 from vkjet.eqrow import EqRowTerm, OperatorTable
 from vkjet.optim import GaussNewtonCG
 from vkjet.tests import context, rel
 from vkjet.tests._fixtures import setup, sample_operators, random_rows
 
-GRID = (4, 4, 4, 4)
+GRID = (8, 8, 8, 8)          # the BPX arm needs a cubic-representable coarse level (4, 4, 4, 4)
 
 
 class TestCmdBatching(unittest.TestCase):
@@ -70,22 +73,52 @@ class TestCmdBatching(unittest.TestCase):
         self.assertLess(rel(d_bat, d_seq), 1e-5)
         self.assertNotEqual(opt._seq_key, key)
 
+    def bpx(self, opt):
+        """A two-level BPX on this grid: the coarse level with a random positive
+        diagonal, the fine level with the optimiser's own."""
+        _, bc, _, nc = setup((4, 4, 4, 4))
+        dc = self.ctx.buffer(nc * 4)
+        dc.upload((1.0 + np.random.default_rng(3).random(nc)).astype(np.float32))   # the SAME preconditioner every call
+        return BpxPreconditioner(self.ctx, [b.primal_extent for b in self.bases], 5,
+                                 [dict(ext=[b.primal_extent for b in bc], diag=dc, dmax=2.0),
+                                  dict(ext=[b.primal_extent for b in self.bases], diag=opt.diag,
+                                       dmax=float(opt.diag_max))])
+
+    def test_bpx_solve_and_key(self):
+        opt = GaussNewtonCG(self.ctx, self.n); self.prep(opt)
+        mu = 1e-2 * opt.diag_max
+        opt.set_preconditioner(self.bpx(opt))
+        d_seq, d_bat = self.solve_both(opt, mu)
+        self.assertLess(rel(d_bat, d_seq), 1e-5)
+        key = opt._seq_key
+        d_seq, d_bat = self.solve_both(opt, 0.3 * opt.diag_max)      # μ retry: same sequence
+        self.assertLess(rel(d_bat, d_seq), 1e-5)
+        self.assertEqual(opt._seq_key, key)
+        opt.set_preconditioner(None)                                  # preconditioner change: re-record
+        d_seq, d_bat = self.solve_both(opt, mu)
+        self.assertLess(rel(d_bat, d_seq), 1e-5)
+        self.assertNotEqual(opt._seq_key, key)
+
     def test_fit_equivalence(self):
-        def fit(force_seq):
-            o = GaussNewtonCG(self.ctx, self.n); o.set_coef(np.zeros(self.n, np.float32))
-            if force_seq:
-                o._pcg_batched = lambda t, m, c: o._pcg(t, m, c, 1e-3)
+        for use_bpx in (False, True):
+            with self.subTest(bpx=use_bpx):
+                h_seq, h_bat = self.fit(True, use_bpx), self.fit(False, use_bpx)
+                dev = float(np.max(np.abs(h_bat - h_seq) / h_seq))        # per step: the late losses are tiny
+                self.assertLess(dev, 1e-3, f"loss trajectories deviate {dev:.2e}")
 
-            def lf():
-                self.loss_buf.zero()
-                for t in self.terms:
-                    t.loss(o.coef, self.loss_buf)
-                return float(self.loss_buf.download(np.float32, 1)[0])
-            return np.array([o.step(self.terms, lf, cg_iters=6)[0] for _ in range(8)])
+    def fit(self, force_seq, use_bpx=False):
+        o = GaussNewtonCG(self.ctx, self.n); o.set_coef(np.zeros(self.n, np.float32))
+        if use_bpx:
+            self.prep(o); o.set_preconditioner(self.bpx(o)); o.set_coef(np.zeros(self.n, np.float32))
+        if force_seq:
+            o._pcg_batched = lambda t, m, c: o._pcg(t, m, c, 1e-3)
 
-        h_seq, h_bat = fit(True), fit(False)
-        dev = float(np.abs(h_bat - h_seq).max() / h_seq[-1])
-        self.assertLess(dev, 1e-3, f"loss trajectories deviate {dev:.2e}")
+        def lf():
+            self.loss_buf.zero()
+            for t in self.terms:
+                t.loss(o.coef, self.loss_buf)
+            return float(self.loss_buf.download(np.float32, 1)[0])
+        return np.array([o.step(self.terms, lf, cg_iters=6)[0] for _ in range(8)])
 
 
 if __name__ == "__main__":

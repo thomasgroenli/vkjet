@@ -72,8 +72,12 @@ class SeparableTransfer:
             self.axes.append({"fwd": self._up(pf, cf, vf),
                               "bwd": self._up(pt, ct, vt)})
         self.active = [d for d in range(len(self.ec)) if self.ec[d] != self.ef[d]]
+        # one meta buffer per (axis, direction); its contents are a function of
+        # the level alone, so they are uploaded once and the apply is capturable
+        # (under capture host writes land immediately, dispatches at submit)
         self.meta = [ctx.buffer(20, device_local=False)
                      for _ in range(2 * len(self.ec))]
+        self._meta_val = [None] * (2 * len(self.ec))
 
     def _up(self, ptr, col, val):
         bufs = []
@@ -83,8 +87,12 @@ class SeparableTransfer:
         return bufs
 
     def _pass(self, mi, tabs, n_out, n_in, outer, inner, src, dst, accum):
-        self.meta[mi].upload(struct.pack("<5i", n_out, n_in, outer, inner,
-                                         int(accum)))
+        val = (n_out, n_in, outer, inner, int(accum))
+        if self._meta_val[mi] != val:
+            assert self.ctx._capture is None or self._meta_val[mi] is None, \
+                "transfer meta changed inside a captured sequence"
+            self.meta[mi].upload(struct.pack("<5i", *val))
+            self._meta_val[mi] = val
         n = outer * n_out * inner
         self.ctx.run(self.prog, [self.meta[mi], tabs[0], tabs[1], tabs[2],
                                  src, dst],
@@ -134,7 +142,6 @@ class BpxPreconditioner:
         self.ext_f = tuple(int(v) for v in ext_fine)
         n_f = int(np.prod(self.ext_f))
         self.pdiv_prog = ctx.program(VEC_PDIV_SPV, bindings=[STORAGE] * 4)
-        self.pmeta = ctx.buffer(12, device_local=False)
         self.axis_prog = self.scratch = None
         if any(tuple(L["ext"]) != self.ext_f for L in levels):
             self.axis_prog = ctx.program(AXIS_SPV, bindings=[STORAGE] * 6)
@@ -143,6 +150,10 @@ class BpxPreconditioner:
             L["ext"] = tuple(int(v) for v in L["ext"])
             L["nl"] = int(np.prod(L["ext"])) * self.nch
             L["floor"] = self.floor_rel * L["dmax"]
+            # the level's division meta (n, floor), fixed for the level's life:
+            # no per-apply host write, so the apply records into a CommandSequence
+            L["pmeta"] = ctx.buffer(12, device_local=False)
+            L["pmeta"].upload(struct.pack("<i2f", L["nl"], float(L["floor"]), 0.0))
             if L["ext"] == self.ext_f:
                 L["T"] = None
             else:
@@ -150,21 +161,21 @@ class BpxPreconditioner:
                                            self.axis_prog, self.scratch, order)
                 L["rbuf"] = ctx.buffer(L["nl"] * 4)
 
-    def _pdiv(self, x, d, a, z, n):                  # z = x/(d + a) over n elems
-        self.pmeta.upload(struct.pack("<i2f", n, float(a), 0.0))
-        self.ctx.run(self.pdiv_prog, [x, d, z, self.pmeta],
-                     groups=min((n + 255) // 256, 4096))
+    def _pdiv(self, x, L, z):                        # z = x/(diag_l + floor_l)
+        self.ctx.run(self.pdiv_prog, [x, L["diag"], z, L["pmeta"]],
+                     groups=min((L["nl"] + 255) // 256, 4096))
 
     def apply(self, r_buf, z_buf):
-        """z = Σ_l P_l (P_lᵀ r)/(diag_l + floor_l). Writes z_buf."""
+        """z = Σ_l P_l (P_lᵀ r)/(diag_l + floor_l). Writes z_buf. Pure dispatches
+        (no host writes), so it records into a captured CG solve."""
         wrote = False
         for L in self.levels:                        # identity (finest) first
             if L["T"] is None:
-                self._pdiv(r_buf, L["diag"], L["floor"], z_buf, L["nl"])
+                self._pdiv(r_buf, L, z_buf)
                 wrote = True
         for L in self.levels:                        # then coarse corrections
             if L["T"] is not None:
                 L["T"].restrict(r_buf, L["rbuf"])
-                self._pdiv(L["rbuf"], L["diag"], L["floor"], L["rbuf"], L["nl"])
+                self._pdiv(L["rbuf"], L, L["rbuf"])
                 L["T"].prolong(L["rbuf"], z_buf, accum=wrote)
                 wrote = True
