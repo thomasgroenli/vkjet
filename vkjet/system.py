@@ -89,6 +89,8 @@ class Solve:
     bpx_floor: float = 1e-2
     stop_rel: float = 0.0
     stop_window: int = 5
+    minibatch: int = 0            # rows per bucket (0 = one batch = K=1); the general form of the contract
+    batch_tol: float = 0.15       # norm-test tolerance for the effective batch
     seed: int = 0
     gpu: int = 0
     verbose: bool = True
@@ -237,7 +239,8 @@ class RowSystem:
         res = fit_rows(rows, ops, lo=f.lo, hi=f.hi, base_grid=f.base_grid, n_stages=f.n_stages,
                        periodic=f.periodic, steps=S.steps, cg_iters=S.cg_iters, bpx=S.bpx,
                        bpx_floor=S.bpx_floor, tau=self.tau, init=init, seed=S.seed,
-                       stop_rel=S.stop_rel, stop_window=S.stop_window, ctx=ctx, verbose=S.verbose)
+                       stop_rel=S.stop_rel, stop_window=S.stop_window, minibatch=S.minibatch,
+                       batch_tol=S.batch_tol, ctx=ctx, verbose=S.verbose)
         return FitResult(self, res.coef, res.stage_losses, res.diagnostics, ctx if own else ctx)
 
 

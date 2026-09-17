@@ -111,7 +111,7 @@ class FitResult:
 # execution-tier selection (semantics-preserving)                             #
 # --------------------------------------------------------------------------- #
 def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose,
-               fuzz=None, modulus=None):
+               fuzz=None, modulus=None, of_row=None, nb=1):
     """Compile a specialised kernel per operator where possible.
 
     Payload-free operators that share an IDENTICAL point set fuse into one
@@ -124,7 +124,13 @@ def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose,
     operator with any wrapped row stays off it (silently treating a congruence
     as an equality would change the objective); it carries ONE sigma per point,
     so co-located operators must agree on sigma or they go per-op.
+
+    `of_row` (global per-row bucket id, nb buckets) binds every term with the
+    SAME partition of the one row system (minibatching); None = one batch.
     """
+    from .rowbatch import local_buckets
+    lb = ((lambda sel: [np.arange(len(sel))]) if of_row is None
+          else (lambda sel: local_buckets(of_row, sel, nb)))
     handled = np.zeros(len(x), bool)
     terms = []
     try:
@@ -175,7 +181,10 @@ def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose,
             xp = x[members[0][1]]
             W = np.stack([w[r] for _, r in members], 1)
             S = np.stack([s[r] for _, r in members], 1)
-            gt.bind_points(axes.encode(xp), W, S, sigma=sg)
+            if of_row is None:
+                gt.bind_points(axes.encode(xp), W, S, sigma=sg)
+            else:
+                gt.bind_point_buckets(axes.encode(xp), W, S, lb(members[0][1]), sigma=sg)
             terms.append((gt, frozenset(gids)))
             for _, r in members:
                 handled[r] = True
@@ -194,10 +203,16 @@ def _jit_terms(ctx, axes, bases, grid, x, op, w, s, c, ops, iw, verbose,
         try:
             gt = GeneratedRowTerm(ctx, bases, iw, ops, int(k), compiler=comp)
             verify_generated(ctx, gt, bases, iw, ops, int(k))
-            gt.bind_batch(axes.encode(x[m]), np.zeros(int(m.sum()), np.int32),
-                          w[m], s[m], c[m],
-                          fuzz=(None if fz is None else fz[m]),
-                          modulus=(None if mm is None else mm[m]))
+            if of_row is None:
+                gt.bind_batch(axes.encode(x[m]), np.zeros(int(m.sum()), np.int32),
+                              w[m], s[m], c[m],
+                              fuzz=(None if fz is None else fz[m]),
+                              modulus=(None if mm is None else mm[m]))
+            else:
+                gt.bind_buckets(axes.encode(x[m]), np.zeros(int(m.sum()), np.int32),
+                                w[m], s[m], c[m], lb(np.flatnonzero(m)),
+                                fuzz=(None if fz is None else fz[m]),
+                                modulus=(None if mm is None else mm[m]))
             terms.append((gt, frozenset([int(k)])))
             handled |= m
         except Exception as ex:
@@ -235,7 +250,8 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
              periodic=(True, False, False, False), dispatch=True,
              resample_every=0, bpx=False, bpx_floor=1e-2,
              tau=0.0, tau_end=None, init=None, callback=None, seed=0,
-             stop_rel=0.0, stop_window=5, ctx=None, verbose=True):
+             stop_rel=0.0, stop_window=5, minibatch=0, batch_tol=0.15,
+             ctx=None, verbose=True):
     """Fit a spline field from jet rows (array pair, or a save_rows path).
 
     `rows` may also be a CALLABLE grid -> (rows, ops): it is asked once per
@@ -287,9 +303,24 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
     direction is left. The diagnostics carry `pred_rel` per accepted step,
     `steps_used` and `floor`.
 
+    MINIBATCHING (minibatch > 0 = target rows per bucket): the row system is
+    partitioned into K = len(rows)//minibatch buckets and each outer step
+    draws buckets in random order until the norm test passes (`batch_tol`),
+    so the effective batch self-calibrates. This is the GENERAL form of the
+    contract, not an optimisation of it: the full solve is K=1, where the
+    bucket IS the full row set (aliased, no copy) and the dispatches are
+    those of minibatch=0 (tests/test_minibatch.py). Every term is bucketed —
+    no deterministic baseline, since that would mean the solver deciding
+    which rows are data and which are physics. diag and loss stay full-batch:
+    diag is the preconditioner, loss is the real objective that LM
+    accept/reject and the stop test read. The stopping floor then measures
+    itself in the right regime: two gradients at the same coefficients differ
+    by fp32 order at K=1 and by the bucket draw at K>1.
+
     Returns a :class:`FitResult`.
     """
     t0 = time.time()
+    from .rowbatch import row_buckets, BatchedRowSystem
     per_stage = callable(rows)
     if isinstance(rows, (str, os.PathLike)):
         rows, ops = load_rows(rows)
@@ -343,26 +374,39 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
         xx, oo, ww, ss, cc, ff, mq = (a[order] for a in (xx, oo, ww, ss, cc, ff, mq))
         return np.ascontiguousarray(xx), oo, ww, ss, cc, ff, mq, order
 
-    def make_terms(ax_, bs_, g, xx, oo, ww, ss, cc, ff, mq, ops_, verbose_):
-        """Terms for one row set on grid g (JIT where possible, generic rest)."""
+    def make_terms(ax_, bs_, g, xx, oo, ww, ss, cc, ff, mq, ops_, verbose_, of_row=None, nb=1):
+        """Terms for one row set on grid g (JIT where possible, generic rest);
+        with `of_row` every term is bound with the same bucket partition."""
+        from .rowbatch import local_buckets
         iw_ = [g[k] / ext[k] for k in range(nd)]
         if dispatch:
             tt, hd = _jit_terms(ctx, ax_, bs_, g, xx, oo, ww, ss, cc, ops_, iw_,
-                                verbose_, fuzz=ff, modulus=mq)
+                                verbose_, fuzz=ff, modulus=mq, of_row=of_row, nb=nb)
             if not hd.all():
                 gen = EqRowTerm(ctx, bs_, iw_, ops_)
-                r = ~hd
-                gen.bind_batch(ax_.encode(xx[r]), oo[r], ww[r], ss[r], cc[r],
-                               fuzz=ff[r], modulus=mq[r])
+                r = np.flatnonzero(~hd)
+                if of_row is None:
+                    gen.bind_batch(ax_.encode(xx[r]), oo[r], ww[r], ss[r], cc[r],
+                                   fuzz=ff[r], modulus=mq[r])
+                else:
+                    gen.bind_buckets(ax_.encode(xx[r]), oo[r], ww[r], ss[r], cc[r],
+                                     local_buckets(of_row, r, nb), fuzz=ff[r], modulus=mq[r])
                 tt.append((gen, frozenset(int(k) for k in np.unique(oo[r]))))
             if verbose_:
                 print(f"    [dispatch] jit {int(hd.sum()):,}  "
                       f"generic {int((~hd).sum()):,}", flush=True)
         else:
             t_ = EqRowTerm(ctx, bs_, iw_, ops_)
-            t_.bind_batch(ax_.encode(xx), oo, ww, ss, cc, fuzz=ff, modulus=mq)
+            if of_row is None:
+                t_.bind_batch(ax_.encode(xx), oo, ww, ss, cc, fuzz=ff, modulus=mq)
+            else:
+                t_.bind_buckets(ax_.encode(xx), oo, ww, ss, cc, row_buckets_from(of_row, nb),
+                                fuzz=ff, modulus=mq)
             tt = [(t_, frozenset(int(k) for k in np.unique(oo)))]
         return tt
+
+    def row_buckets_from(of_row, nb):
+        return [np.flatnonzero(of_row == i) for i in range(nb)]
 
     if not per_stage:
         x, op, w, s, c, fz, mq, row_order = unpack(rows, ops, grids[-1])
@@ -373,7 +417,7 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
         assert coef.size == int(np.prod(prev)) * n_channels, (coef.size, prev)
         if verbose:
             print(f"  [init] warm start from a {prev} field", flush=True)
-    losses = []
+    losses = []; eff_hist = []
     for si, (grid, n_steps) in enumerate(zip(grids, steps)):
         if per_stage:
             stage_rows, ops = rows(grid)
@@ -392,13 +436,36 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
         _first = [True]
         bound = {}          # opset -> dict(term, keys{op: content key}, w0{op: w}, scale)
 
+        _draw = [0]
+
         def build_terms():
             """Terms for the CURRENT rows. On a re-author, an operator whose
             rows (x, s, payload, m, fuzz) are unchanged keeps its bound term;
             if only its weights changed by one common factor the factor
             becomes the term's scale (w·r ≡ scale·w — the objective is the
             same, no rebind); anything else is rebound. Rows stay the whole
-            specification; this is representation, not content."""
+            specification; this is representation, not content.
+            With minibatching every term is bound with one fresh bucket
+            partition and the whole system is wrapped as ONE stochastic term."""
+            if minibatch:
+                nb = max(1, len(x) // int(minibatch))
+                of_row = np.empty(len(x), np.int32)
+                for _i, _ix in enumerate(row_buckets(len(x), nb, seed=seed + 7919 * si + _draw[0])):
+                    of_row[_ix] = _i
+                _draw[0] += 1
+                tt = make_terms(axes, bases, grid, x, op, w, s, c, fz, mq, ops,
+                                verbose and si == 0 and _first[0], of_row=of_row, nb=nb)
+                for t_, _ in tt:
+                    if hasattr(t_, "set_tau"):
+                        t_.set_tau(_tau_now[0])
+                sysw = BatchedRowSystem(ctx, [t_ for t_, _ in tt], n, tol=batch_tol,
+                                        seed=seed + 104729 * si)
+                if verbose and _first[0]:
+                    print(f"  [batch] {len(x):,} rows -> {nb} bucket(s) of ~{len(x) // nb:,}, "
+                          f"norm-test tol={batch_tol:g}{'  (K=1: identity)' if nb == 1 else ''}",
+                          flush=True)
+                _first[0] = False
+                return [sysw]
             first = not bound
             keys = {}; wnow = {}
             for k in np.unique(op):
@@ -545,7 +612,7 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
                       + ("  WARNING: stop_rel <= floor, thresholding noise" if stop_rel <= fl else ""),
                       flush=True)
             return fl
-        pred_rel = []; _rej = 0; steps_used = n_steps
+        pred_rel = []; _rej = 0; steps_used = n_steps; eff = []
 
         for _k in range(n_steps):
             if resample_every and _k and per_stage and _k % resample_every == 0:
@@ -568,6 +635,8 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
                         _t.set_seed(_seed0 + _k)
                 opt.last_loss = None
             _, accepted, _ = opt.step(terms, loss_fn, cg_iters=cg_iters)
+            if minibatch:
+                eff.append(terms[0].eff_batch[0])
             if callback is not None:
                 callback(grid, _k + 1, opt)
             if accepted and opt.last_pred is not None:
@@ -593,12 +662,16 @@ def fit_rows(rows, ops=None, lo=None, hi=None, base_grid=(6, 6, 6, 12),
                     break
         coef, prev = opt.get_coef(), grid
         losses.append(opt.last_loss)
+        eff_hist.append(list(eff))
+        if verbose and eff and max(eff) > 1:
+            print(f"  [batch] effective batch {np.mean(eff):.1f}/{max(1, len(x) // int(minibatch))} "
+                  f"buckets mean (min {min(eff)}, max {max(eff)})", flush=True)
         if verbose:
             print(f"  [stage {grid}] loss {opt.last_loss:.4g}  "
                   f"({time.time()-t0:.0f}s)", flush=True)
 
     diag = {"stage_losses": losses, "seconds": time.time() - t0,
             "row_order": row_order, "pred_rel": pred_rel, "steps_used": steps_used,
-            "floor": floor}
+            "floor": floor, "eff_batch": eff_hist}
     return FitResult(ctx, coef, axes, bases, extents, losses,
                      n_channels=n_channels, diagnostics=diag)

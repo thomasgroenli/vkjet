@@ -61,6 +61,135 @@ class _MaxReduce:
         return float(self.umax.download(np.float32, 1)[0]) + 1e-30   # uint bits == float bits
 
 
+class NormTestBatcher:
+    """Self-calibrating gradient accumulation (Byrd–Bollapragada norm test).
+
+    Sums fixed-size minibatches (the hardware work-unit) into a gradient estimate and
+    stops when the across-minibatch variance falls below tol²·‖ĝ‖² — i.e. when the
+    estimate is statistically stable. The effective batch tracks the gradient SNR, NOT
+    the dataset size, so it self-adapts to unknown over/under-sampling: massively
+    oversampled → a few minibatches; scarce/near-optimum → (nearly) all of them.
+    """
+
+    def __init__(self, ctx: Context, n_params: int, coord_var: bool = False):
+        self.ctx = ctx
+        self.n = int(n_params)
+        self.gk = ctx.buffer(self.n * 4)
+        self.M = ctx.buffer(self.n * 4)         # accumulated data minibatch sum
+        self.combined = ctx.buffer(self.n * 4)  # scale·M + G_det (combined-norm scratch)
+        self.scalar = ctx.buffer(4)
+        self.vmeta = ctx.buffer(12, device_local=False)
+        self.dot_p = ctx.program(VEC_DOT_SPV, bindings=[STORAGE] * 4)
+        self.axpby_p = ctx.program(VEC_AXPBY_SPV, bindings=[STORAGE] * 4)
+        # per-COORDINATE variance of the data-gradient estimate (SNR gate consumer):
+        # alongside M = Σ_k g_k also accumulate Q = Σ_k g_k∘g_k elementwise.
+        self.coordv = bool(coord_var)
+        if self.coordv:
+            self.Q = ctx.buffer(self.n * 4)
+            self.madd_p = ctx.program(VEC_MADD_DIAG_SPV, bindings=[STORAGE] * 4)
+        self._K_used = 0; self._nmb = 0
+        # SNR state recorded by gradient_combined (see its docstring)
+        self.last_var = None; self.last_norm2 = None
+        self.passed = False; self.exhausted = False
+
+    def _g(self): return min((self.n + 255) // 256, 4096)
+    def _vm(self, a, b): self.vmeta.upload(struct.pack("<i2f", self.n, a, b)); return self.vmeta
+
+    def _dot(self, a, b):
+        self.scalar.zero()
+        self.ctx.run(self.dot_p, [a, b, self.scalar, self._vm(0.0, 0.0)], groups=self._g())
+        return float(self.scalar.download(np.float32, 1)[0])
+
+    def _axpby(self, x, y, a, b, z):
+        self.ctx.run(self.axpby_p, [x, y, z, self._vm(a, b)], groups=self._g())
+
+    def gradient(self, term, coef_buf, grad_out, tol=0.1, order=None):
+        """Accumulate minibatches of `term` (a FusedDataGrad bound via bind_minibatches)
+        into grad_out, scaled to the full population. Returns (used_minibatch_indices, scale)
+        — the SAME set must drive the HVP so CG sees a consistent operator.
+        """
+        mbs = term.minibatches
+        nmb = len(mbs)
+        order = list(order) if order is not None else list(range(nmb))
+        grad_out.zero()
+        Q = 0.0; used = []
+        for k in order:
+            self.gk.zero()
+            term.accumulate(coef_buf, self.gk, batch=mbs[k])      # minibatch gradient (sum)
+            Q += self._dot(self.gk, self.gk)
+            self._axpby(self.gk, grad_out, 1.0, 1.0, grad_out)    # M += gk
+            used.append(k); K = len(used)
+            if K >= 2:
+                m2 = self._dot(grad_out, grad_out)
+                if (Q - m2 / K) * K / (K - 1) <= tol * tol * m2:  # Var(ĝ) ≤ tol²‖ĝ‖²
+                    break
+        scale = float(nmb) / len(used)
+        if scale != 1.0:
+            self._axpby(grad_out, grad_out, scale, 0.0, grad_out)  # scale to full population
+        return used, scale
+
+    def gradient_combined(self, term, coef_buf, grad, tol=0.15, order=None):
+        """Combined-gradient norm test. ``grad`` enters holding the DETERMINISTIC baseline
+        G_det (wall+pde, accumulated first), unmodified until the end. The data minibatch
+        sum M accumulates separately; the stopping test compares the data-estimate variance
+        to the COMBINED norm ‖scale·M + G_det‖ — so cancellation between data and PDE near
+        the solution shrinks the denominator and forces a larger effective batch. Leaves
+        grad = G_det + scale·M = G_combined. Returns (used_indices, scale).
+
+        Records the SNR state for the two §3.3/§3.4 consumers: ``last_var`` (variance of the
+        scaled data estimate — its √ is the CG noise-forcing target), ``last_norm2``
+        (‖G_combined‖² at the last test), ``passed`` (the norm test was met), ``exhausted``
+        (all minibatches consumed). exhausted ∧ ¬passed = the FULL-batch gradient fails its
+        own SNR test — the statistical stopping signal ("the gradient is noise").
+        """
+        mbs = term.minibatches
+        nmb = len(mbs)
+        order = list(order) if order is not None else list(range(nmb))
+        self.M.zero(); Q = 0.0; used = []
+        if self.coordv:
+            self.Q.zero()
+        self.last_var = None; self.last_norm2 = None; self.passed = False
+        for k in order:
+            self.gk.zero()
+            term.accumulate(coef_buf, self.gk, batch=mbs[k])
+            Q += self._dot(self.gk, self.gk)
+            if self.coordv:                                       # Q_i += gk_i²
+                self.ctx.run(self.madd_p, [self.gk, self.gk, self.Q,
+                                           self._vm(1.0, 0.0)], groups=self._g())
+            self._axpby(self.gk, self.M, 1.0, 1.0, self.M)        # M += gk
+            used.append(k); K = len(used)
+            # tol ≤ 0 ⇒ pure variance ESTIMATION (full batch by construction):
+            # the per-minibatch stopping test can never pass, so skip its dots +
+            # downloads and compute the estimate once, at the final K.
+            if K >= 2 and (tol > 0.0 or K == nmb):
+                mM = self._dot(self.M, self.M)
+                var = float(nmb * nmb) * ((Q - mM / K) / (K - 1)) / K   # Var(scaled data est.)
+                self._axpby(self.M, grad, float(nmb) / K, 1.0, self.combined)  # scale·M + G_det
+                self.last_var = var
+                self.last_norm2 = self._dot(self.combined, self.combined)
+                if tol > 0.0 and var <= tol * tol * self.last_norm2:
+                    self.passed = True
+                    break
+        self.exhausted = len(used) == nmb
+        self._K_used = len(used); self._nmb = nmb
+        scale = float(nmb) / len(used)
+        self._axpby(self.M, grad, scale, 1.0, grad)              # grad = G_det + scale·M
+        return used, scale
+
+    def coord_var_host(self):
+        """Per-coordinate variance of the SCALED data-gradient estimate from the last
+        gradient_combined call (requires coord_var=True): Var_i = nmb²·(Q_i − M_i²/K)
+        / (K(K−1)) — the elementwise analog of last_var. Clipped at 0 (the fp32
+        Q − M²/K cancellation only matters where signal ≫ noise, i.e. where the
+        gate is inactive anyway). Host round-trip: 2 downloads of n floats."""
+        K, nmb = self._K_used, self._nmb
+        if not self.coordv or K < 2:
+            return np.zeros(self.n)
+        Q = self.Q.download(np.float32, self.n).astype(np.float64)
+        M = self.M.download(np.float32, self.n).astype(np.float64)
+        return np.maximum(float(nmb * nmb) * (Q - M * M / K) / (K * (K - 1)), 0.0)
+
+
 class GaussNewtonCG:
     """Matrix-free Gauss-Newton with preconditioned-CG inner solve + LM outer loop.
 
@@ -398,9 +527,15 @@ class GaussNewtonCG:
         accepted = False; used = 0
         # batched path: fixed iterations, diag preconditioner, deterministic term
         # set (a MinibatchedTerm redraws its minibatch set per step → unbatchable)
+        # A term may declare `stochastic`: a BatchedRowSystem does, and says False
+        # at K=1, where the drawn set is the full row set every step and the
+        # captured sequence stays valid. Without that, wrapping the full solve
+        # would silently cost it the capture.
+        def _redraws(t):
+            st = getattr(t, "stochastic", None)
+            return hasattr(t, "batcher") if st is None else bool(st)
         batchable = (noise == 0.0 and newton_eps == 0.0 and self.bpx is None
-                     and snr_gate is None
-                     and not any(hasattr(t, "batcher") for t in terms))
+                     and snr_gate is None and not any(_redraws(t) for t in terms))
         for _ in range(max_tries):
             mu_abs = self.mu_rel * self.diag_max
             if batchable:
