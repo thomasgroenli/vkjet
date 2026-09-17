@@ -449,7 +449,7 @@ def _compile(src, out_path, compiler):
     useless without it."""
     kind, path = compiler
     out_dir = os.path.dirname(out_path) or "."
-    with tempfile.NamedTemporaryFile("w", suffix=".comp", delete=False) as f:
+    with tempfile.NamedTemporaryFile("w", suffix=".comp", delete=False, encoding="utf-8") as f:
         f.write(src)
         tmp = f.name
     fd, tmp_spv = tempfile.mkstemp(dir=out_dir, suffix=".spv.tmp")
@@ -461,7 +461,7 @@ def _compile(src, out_path, compiler):
         else:
             cmd = [path, "--target-env", "vulkan1.1", "-S", "comp",
                    tmp, "-o", tmp_spv]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
         if r.returncode != 0 or not valid_spv(tmp_spv):
             kept = out_path + ".failed.comp"
             try:

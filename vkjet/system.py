@@ -131,7 +131,7 @@ class FitResult:
 
     def save_summary(self, out):
         os.makedirs(out, exist_ok=True)
-        with open(os.path.join(out, "fit.json"), "w") as f_:
+        with open(os.path.join(out, "fit.json"), "w", encoding="utf-8") as f_:
             json.dump(dict(loss=self.loss, losses=self.losses, steps_used=self.steps_used,
                            floor=self.diagnostics.get("floor"),
                            pred_rel=[None if not np.isfinite(v) else float(v) for v in self.trace],
